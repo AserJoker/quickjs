@@ -18,7 +18,7 @@ add_executable(qjsc qjsc.c quickjs.c libregexp.c libunicode.c cutils.c quickjs-l
 
 add_executable(qjs qjs.c repl.c quickjs.c libregexp.c libunicode.c cutils.c quickjs-libc.c libbf.c qjscalc.c)
 
-add_library(quickjs quickjs.c libregexp.c libunicode.c cutils.c quickjs-libc.c libbf.c)
+add_library(quickjs SHARED quickjs.c libregexp.c libunicode.c cutils.c quickjs-libc.c libbf.c)
 
 target_link_libraries(qjsc pthread m)
 target_link_libraries(qjs pthread m)
