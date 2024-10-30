@@ -3,7 +3,7 @@ project(quickjs)
 
 string(TIMESTAMP COMPILE_TIME %Y-%m-%d)
 
-# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -MMD -MF -Wno-array-bounds -Wno-format-truncation -fwrapv")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -MMD -MF -Wno-array-bounds -Wno-format-truncation -fwrapv")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${PROJECT_SOURCE_DIR})
 
