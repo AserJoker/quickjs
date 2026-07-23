@@ -8540,13 +8540,18 @@ JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
     JSFunctionBytecode *b;
     int i, frame_count;
 
+    /* get a context from the context list for error reporting */
+    if (list_empty(&rt->context_list))
+        return JS_EXCEPTION;
+    ctx = list_entry(rt->context_list.next, JSContext, link);
+
     /* walk to the requested frame */
     frame_count = 0;
     for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
         frame_count++;
 
     if (frame_index < 0 || frame_index >= frame_count)
-        return JS_ThrowReferenceError(NULL, "invalid frame index %d", frame_index);
+        return JS_ThrowReferenceError(ctx, "invalid frame index %d", frame_index);
 
     sf = rt->current_stack_frame;
     for (i = 0; i < frame_index; i++)
@@ -8554,7 +8559,7 @@ JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
 
     b = dbg_get_bytecode(sf->cur_func);
     if (!b || !b->realm)
-        return JS_ThrowTypeError(NULL, "cannot evaluate in native frame");
+        return JS_ThrowTypeError(ctx, "cannot evaluate in native frame");
 
     ctx = b->realm;
 
