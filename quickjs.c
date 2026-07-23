@@ -369,6 +369,28 @@ struct JSRuntime {
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
+    /* debug state */
+    uint8_t debug_state; /* JS_DEBUG_RUNNING/PAUSING/PAUSED/STEPPING */
+    void *debug_callback; /* JSDebugCallback* — opaque here, typed in API */
+    void *debug_opaque;
+    void (*debug_drain_queue)(void *opaque);
+
+    /* breakpoint management */
+    struct JSDbgBreakpoint {
+        uint32_t id;
+        JSAtom filename;
+        int line;
+        int hit_count;
+    } *debug_breakpoints;
+    int debug_breakpoint_count;
+    int debug_breakpoint_size;
+    uint32_t debug_next_bp_id;
+    uint8_t debug_breakpoint_set; /* optimization: 1 if any breakpoints exist */
+
+    /* step state */
+    int debug_step_kind;       /* 0=into, 1=over, 2=out */
+    int debug_step_target_depth;
+
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
     // for smuggling the parent promise from js_promise_then
@@ -841,7 +863,8 @@ typedef struct JSFunctionBytecode {
     uint8_t super_allowed : 1;
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
-    /* XXX: 5 bits available */
+    uint8_t has_debug_info : 1;    /* debug info (bp_sites) present */
+    /* XXX: 4 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -863,6 +886,13 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    /* debug info */
+    struct JSBreakpointSite {
+        uint32_t bytecode_offset;
+        int32_t line;
+        int32_t col;
+    } *bp_sites; /* (self pointer) */
+    uint16_t bp_site_count;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -2627,6 +2657,16 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+
+    /* free debug breakpoints */
+    if (rt->debug_breakpoints) {
+        for(i = 0; i < rt->debug_breakpoint_count; i++)
+            JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+        js_free_rt(rt, rt->debug_breakpoints);
+        rt->debug_breakpoints = NULL;
+        rt->debug_breakpoint_count = 0;
+        rt->debug_breakpoint_set = 0;
+    }
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -8104,6 +8144,426 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
     if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
         return NULL;
     return JS_ToCString(ctx, val);
+}
+
+/* ---- Debug API implementation ---- */
+
+/* Helper: get function bytecode from a stack frame's cur_func.
+   Duplicates the static JS_GetFunctionBytecode logic since that is static. */
+static JSFunctionBytecode *dbg_get_bytecode(JSValueConst val)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(val);
+    if (!js_class_has_bytecode(p->class_id))
+        return NULL;
+    return p->u.func.function_bytecode;
+}
+
+/* Helper: duplicate a C string using js_malloc_rt */
+static char *dbg_strdup_rt(JSRuntime *rt, const char *s)
+{
+    size_t len = strlen(s) + 1;
+    char *p = js_malloc_rt(rt, len);
+    if (p)
+        memcpy(p, s, len);
+    return p;
+}
+
+static int compute_call_depth(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+    int depth = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        depth++;
+    return depth;
+}
+
+void JS_SetDebugCallback(JSRuntime *rt, JSDebugCallback *cb, void *opaque)
+{
+    rt->debug_callback = (void *)cb;
+    rt->debug_opaque = opaque;
+}
+
+void JS_SetDebugDrainQueue(JSRuntime *rt, void (*drain)(void *opaque))
+{
+    rt->debug_drain_queue = drain;
+}
+
+void JS_DebugPause(JSRuntime *rt)
+{
+    rt->debug_state = JS_DEBUG_PAUSING;
+}
+
+void JS_DebugContinue(JSRuntime *rt)
+{
+    rt->debug_state = JS_DEBUG_RUNNING;
+}
+
+void JS_DebugStep(JSRuntime *rt, int kind)
+{
+    rt->debug_step_kind = kind;
+    rt->debug_step_target_depth = compute_call_depth(rt);
+    rt->debug_state = JS_DEBUG_STEPPING;
+}
+
+int JS_DebugGetState(JSRuntime *rt)
+{
+    return rt->debug_state;
+}
+
+uint32_t JS_DebugSetBreakpoint(JSRuntime *rt, const char *filename, int line)
+{
+    struct JSDbgBreakpoint *bp;
+    JSContext *ctx;
+    JSAtom atom;
+
+    /* get a context from the context list to create the atom */
+    if (list_empty(&rt->context_list))
+        return 0;
+    ctx = list_entry(rt->context_list.next, JSContext, link);
+
+    atom = JS_NewAtom(ctx, filename);
+    if (atom == JS_ATOM_NULL)
+        return 0;
+
+    /* grow array if needed */
+    if (rt->debug_breakpoint_count >= rt->debug_breakpoint_size) {
+        int new_size = rt->debug_breakpoint_size ? rt->debug_breakpoint_size * 2 : 8;
+        struct JSDbgBreakpoint *new_arr;
+        new_arr = js_realloc_rt(rt, rt->debug_breakpoints,
+                                new_size * sizeof(struct JSDbgBreakpoint));
+        if (!new_arr) {
+            JS_FreeAtomRT(rt, atom);
+            return 0;
+        }
+        rt->debug_breakpoints = new_arr;
+        rt->debug_breakpoint_size = new_size;
+    }
+
+    bp = &rt->debug_breakpoints[rt->debug_breakpoint_count++];
+    bp->id = ++rt->debug_next_bp_id;
+    bp->filename = atom;
+    bp->line = line;
+    bp->hit_count = 0;
+
+    rt->debug_breakpoint_set = 1;
+    return bp->id;
+}
+
+int JS_DebugRemoveBreakpoint(JSRuntime *rt, uint32_t id)
+{
+    int i;
+    for (i = 0; i < rt->debug_breakpoint_count; i++) {
+        if (rt->debug_breakpoints[i].id == id) {
+            JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+            /* shift remaining entries */
+            memmove(&rt->debug_breakpoints[i], &rt->debug_breakpoints[i + 1],
+                    (rt->debug_breakpoint_count - i - 1) * sizeof(struct JSDbgBreakpoint));
+            rt->debug_breakpoint_count--;
+            if (rt->debug_breakpoint_count == 0)
+                rt->debug_breakpoint_set = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void JS_DebugClearBreakpoints(JSRuntime *rt)
+{
+    int i;
+    for (i = 0; i < rt->debug_breakpoint_count; i++)
+        JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+    js_free_rt(rt, rt->debug_breakpoints);
+    rt->debug_breakpoints = NULL;
+    rt->debug_breakpoint_count = 0;
+    rt->debug_breakpoint_size = 0;
+    rt->debug_breakpoint_set = 0;
+}
+
+static int check_breakpoint_hit(JSRuntime *rt, JSAtom filename, int line)
+{
+    int i;
+    for (i = 0; i < rt->debug_breakpoint_count; i++) {
+        if (rt->debug_breakpoints[i].filename == filename &&
+            rt->debug_breakpoints[i].line == line) {
+            rt->debug_breakpoints[i].hit_count++;
+            return rt->debug_breakpoints[i].id;
+        }
+    }
+    return 0;
+}
+
+int JS_DebugCaptureStack(JSRuntime *rt, JSDebugFrameInfo **pframes)
+{
+    JSStackFrame *sf;
+    JSContext *ctx;
+    JSDebugFrameInfo *frames;
+    int count, i;
+
+    /* count frames */
+    count = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        count++;
+
+    if (count == 0) {
+        *pframes = NULL;
+        return 0;
+    }
+
+    frames = (JSDebugFrameInfo *)js_malloc_rt(rt, count * sizeof(JSDebugFrameInfo));
+    if (!frames) {
+        *pframes = NULL;
+        return -1;
+    }
+    memset(frames, 0, count * sizeof(JSDebugFrameInfo));
+
+    /* get a context for string operations */
+    ctx = NULL;
+    if (!list_empty(&rt->context_list)) {
+        struct list_head *el = rt->context_list.next;
+        ctx = list_entry(el, JSContext, link);
+    }
+
+    i = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame, i++) {
+        JSFunctionBytecode *b = dbg_get_bytecode(sf->cur_func);
+        if (b && ctx) {
+            const char *name;
+            /* function name */
+            if (b->func_name != JS_ATOM_NULL) {
+                name = JS_AtomToCString(ctx, b->func_name);
+                frames[i].func_name = name ? dbg_strdup_rt(rt, name) : NULL;
+                JS_FreeCString(ctx, name);
+            } else {
+                frames[i].func_name = dbg_strdup_rt(rt, "<anonymous>");
+            }
+            /* filename */
+            if (b->filename != JS_ATOM_NULL) {
+                name = JS_AtomToCString(ctx, b->filename);
+                frames[i].filename = name ? dbg_strdup_rt(rt, name) : NULL;
+                JS_FreeCString(ctx, name);
+            } else {
+                frames[i].filename = dbg_strdup_rt(rt, "<unknown>");
+            }
+            /* line/col from cur_pc */
+            if (sf->cur_pc) {
+                uint32_t pc_val = sf->cur_pc - b->byte_code_buf - 1;
+                int col;
+                frames[i].line = find_line_num(ctx, b, pc_val, &col);
+                frames[i].col = col;
+            } else {
+                frames[i].line = b->line_num;
+                frames[i].col = b->col_num;
+            }
+            frames[i].is_native = 0;
+        } else {
+            /* native or bound function */
+            frames[i].func_name = dbg_strdup_rt(rt, "<native>");
+            frames[i].filename = dbg_strdup_rt(rt, "<native>");
+            frames[i].line = 0;
+            frames[i].col = 0;
+            frames[i].is_native = 1;
+        }
+    }
+
+    *pframes = frames;
+    return count;
+}
+
+void JS_DebugFreeFrameInfo(JSRuntime *rt, JSDebugFrameInfo *frames, int count)
+{
+    int i;
+    if (!frames) return;
+    for (i = 0; i < count; i++) {
+        js_free_rt(rt, frames[i].func_name);
+        js_free_rt(rt, frames[i].filename);
+    }
+    js_free_rt(rt, frames);
+}
+
+int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
+                           JSDebugVarInfo **pvars)
+{
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSContext *ctx;
+    JSDebugVarInfo *vars;
+    int total, i, frame_count;
+
+    /* walk to the requested frame */
+    frame_count = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        frame_count++;
+
+    if (frame_index < 0 || frame_index >= frame_count) {
+        *pvars = NULL;
+        return -1;
+    }
+
+    sf = rt->current_stack_frame;
+    for (i = 0; i < frame_index; i++)
+        sf = sf->prev_frame;
+
+    b = dbg_get_bytecode(sf->cur_func);
+    if (!b) {
+        *pvars = NULL;
+        return 0; /* native frame, no locals */
+    }
+
+    ctx = NULL;
+    if (!list_empty(&rt->context_list)) {
+        struct list_head *el = rt->context_list.next;
+        ctx = list_entry(el, JSContext, link);
+    }
+
+    total = b->arg_count + b->var_count;
+    if (total == 0) {
+        *pvars = NULL;
+        return 0;
+    }
+    vars = (JSDebugVarInfo *)js_malloc_rt(rt, total * sizeof(JSDebugVarInfo));
+    if (!vars) {
+        *pvars = NULL;
+        return -1;
+    }
+    memset(vars, 0, total * sizeof(JSDebugVarInfo));
+
+    /* arguments: vardefs[0..arg_count-1] */
+    for (i = 0; i < b->arg_count && i < total; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        const char *name = ctx ? JS_AtomToCString(ctx, vd->var_name) : NULL;
+        vars[i].name = name ? dbg_strdup_rt(rt, name) : dbg_strdup_rt(rt, "<arg>");
+        if (ctx) JS_FreeCString(ctx, name);
+        vars[i].value = JS_DupValueRT(rt, sf->arg_buf[i]);
+        vars[i].is_arg = 1;
+        vars[i].is_const = vd->is_const;
+        vars[i].is_lexical = vd->is_lexical;
+        vars[i].is_captured = vd->is_captured;
+    }
+
+    /* local variables: vardefs[arg_count..arg_count+var_count-1] */
+    for (i = 0; i < b->var_count && (b->arg_count + i) < total; i++) {
+        int idx = b->arg_count + i;
+        JSVarDef *vd = &b->vardefs[idx];
+        const char *name = ctx ? JS_AtomToCString(ctx, vd->var_name) : NULL;
+        vars[idx].name = name ? dbg_strdup_rt(rt, name) : dbg_strdup_rt(rt, "<var>");
+        if (ctx) JS_FreeCString(ctx, name);
+        vars[idx].value = JS_DupValueRT(rt, sf->var_buf[i]);
+        vars[idx].is_arg = 0;
+        vars[idx].is_const = vd->is_const;
+        vars[idx].is_lexical = vd->is_lexical;
+        vars[idx].is_captured = vd->is_captured;
+    }
+
+    *pvars = vars;
+    return total;
+}
+
+void JS_DebugFreeVarInfo(JSContext *ctx, JSDebugVarInfo *vars, int count)
+{
+    int i;
+    if (!vars) return;
+    for (i = 0; i < count; i++) {
+        js_free(ctx, vars[i].name);
+        JS_FreeValue(ctx, vars[i].value);
+    }
+    js_free(ctx, vars);
+}
+
+int JS_DebugGetBreakpointSites(JSContext *ctx, const char *filename,
+                               JSDebugBPSite **psites)
+{
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el;
+    JSAtom file_atom;
+    int count, site_idx;
+
+    file_atom = JS_NewAtom(ctx, filename);
+
+    /* first pass: count total sites matching filename */
+    count = 0;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *p = list_entry(el, JSGCObjectHeader, link);
+        JSFunctionBytecode *b;
+        if (JS_GC_TYPE(p) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        b = (JSFunctionBytecode *)p;
+        if (!b->has_debug_info || b->filename != file_atom)
+            continue;
+        count += b->bp_site_count;
+    }
+
+    if (count == 0) {
+        JS_FreeAtom(ctx, file_atom);
+        *psites = NULL;
+        return 0;
+    }
+
+    JSDebugBPSite *sites = (JSDebugBPSite *)js_malloc(ctx, count * sizeof(JSDebugBPSite));
+    if (!sites) {
+        JS_FreeAtom(ctx, file_atom);
+        *psites = NULL;
+        return -1;
+    }
+
+    /* second pass: fill sites */
+    site_idx = 0;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *p = list_entry(el, JSGCObjectHeader, link);
+        JSFunctionBytecode *b;
+        int i;
+        if (JS_GC_TYPE(p) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        b = (JSFunctionBytecode *)p;
+        if (!b->has_debug_info || b->filename != file_atom)
+            continue;
+        for (i = 0; i < b->bp_site_count && site_idx < count; i++) {
+            sites[site_idx].offset = b->bp_sites[i].bytecode_offset;
+            sites[site_idx].line = b->bp_sites[i].line;
+            sites[site_idx].col = b->bp_sites[i].col;
+            site_idx++;
+        }
+    }
+
+    JS_FreeAtom(ctx, file_atom);
+    *psites = sites;
+    return site_idx;
+}
+
+JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
+                                 const char *expr)
+{
+    JSStackFrame *sf;
+    JSContext *ctx;
+    JSFunctionBytecode *b;
+    int i, frame_count;
+
+    /* walk to the requested frame */
+    frame_count = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        frame_count++;
+
+    if (frame_index < 0 || frame_index >= frame_count)
+        return JS_ThrowReferenceError(NULL, "invalid frame index %d", frame_index);
+
+    sf = rt->current_stack_frame;
+    for (i = 0; i < frame_index; i++)
+        sf = sf->prev_frame;
+
+    b = dbg_get_bytecode(sf->cur_func);
+    if (!b || !b->realm)
+        return JS_ThrowTypeError(NULL, "cannot evaluate in native frame");
+
+    ctx = b->realm;
+
+    /* Evaluate the expression in the context of the frame's realm.
+       We use JS_Eval with the global object and EVAL_TYPE_GLOBAL + DEBUG_INFO.
+       For now, this is a simple eval; full scope chain evaluation would require
+       reconstructing the variable environment which is complex. */
+    return JS_Eval(ctx, expr, strlen(expr), "<debug-eval>",
+                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_DEBUG_INFO);
 }
 
 /* Note: it is important that no exception is returned by this function */
@@ -20748,6 +21208,76 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_nop):
             BREAK;
+        CASE(OP_debug_sentinel):
+            /* debug sentinel: check if the debugger wants to pause here.
+               Only does work when a debug callback is installed. */
+            if (rt->debug_callback) {
+                JSDebugEventType event = (JSDebugEventType)-1;
+                int line_num, col_num;
+                const char *filename = NULL;
+
+                /* get current source location from pc2line */
+                {
+                    uint32_t offset = (uint32_t)(pc - 1 - b->byte_code_buf);
+                    line_num = find_line_num(ctx, b, offset, &col_num);
+                    if (b->filename != JS_ATOM_NULL) {
+                        filename = JS_AtomToCString(ctx, b->filename);
+                    }
+                }
+
+                if (rt->debug_state == JS_DEBUG_PAUSING) {
+                    /* pause requested */
+                    event = JS_DEBUG_EVENT_BREAKPOINT_HIT;
+                } else if (rt->debug_state == JS_DEBUG_STEPPING) {
+                    int depth = compute_call_depth(rt);
+                    int should_pause = 0;
+                    switch (rt->debug_step_kind) {
+                    case 0: /* step into: always pause */
+                        should_pause = 1;
+                        break;
+                    case 1: /* step over: pause if same depth or shallower */
+                        should_pause = (depth <= rt->debug_step_target_depth);
+                        break;
+                    case 2: /* step out: pause if shallower than target */
+                        should_pause = (depth < rt->debug_step_target_depth);
+                        break;
+                    }
+                    if (should_pause)
+                        event = JS_DEBUG_EVENT_STEP_COMPLETE;
+                } else if (rt->debug_breakpoint_set) {
+                    /* check if we hit a user-set breakpoint */
+                    int bp_id = check_breakpoint_hit(rt, b->filename, line_num);
+                    if (bp_id) {
+                        event = JS_DEBUG_EVENT_BREAKPOINT_HIT;
+                    }
+                }
+                /* Note: debugger; statements also emit OP_debug_sentinel.
+                   They cause a pause when JS_DebugPause() was called, or
+                   when stepping/breakpoint conditions are met. A separate
+                   OP_debugger_stmt could be added later for unconditional
+                   debugger; statement detection. */
+
+                if (event != (JSDebugEventType)-1) {
+                    rt->debug_state = JS_DEBUG_PAUSED;
+
+                    /* notify the debug callback */
+                    {
+                        JSDebugCallback *cb = (JSDebugCallback *)rt->debug_callback;
+                        cb(rt, event, filename ? filename : "<unknown>",
+                           line_num, col_num, rt->debug_opaque);
+                    }
+
+                    /* paused loop: wait for continue/step, drain queue */
+                    while (rt->debug_state == JS_DEBUG_PAUSED) {
+                        if (rt->debug_drain_queue)
+                            rt->debug_drain_queue(rt->debug_opaque);
+                    }
+                }
+
+                if (filename)
+                    JS_FreeCString(ctx, filename);
+            }
+            BREAK;
         CASE(OP_is_undefined_or_null):
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
                 JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
@@ -22162,6 +22692,7 @@ typedef struct JSFunctionDef {
     bool need_home_object : 1;
     bool use_short_opcodes : 1; /* true if short opcodes are used in byte_code */
     bool has_await : 1; /* true if await is used (used in module eval) */
+    bool has_debug_info : 1; /* true if debug info (sentinels, bp_sites) should be emitted */
 
     JSFunctionKindEnum func_kind : 8;
     JSParseFunctionEnum func_type : 7;
@@ -22239,6 +22770,15 @@ typedef struct JSFunctionDef {
 
     char *source;  /* raw source, utf-8 encoded */
     int source_len;
+
+    /* debug info: breakpoint sites */
+    struct BPSite {
+        uint32_t bytecode_offset;
+        int32_t line;
+        int32_t col;
+    } *bp_sites;
+    int bp_site_size;
+    int bp_site_count;
 
     JSModuleDef *module; /* != NULL when parsing a module */
 } JSFunctionDef;
@@ -29247,6 +29787,13 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
+    /* emit debug sentinel at the start of each statement */
+    if (s->cur_func->has_debug_info &&
+        s->token.val != '{' && s->token.val != TOK_BREAK && s->token.val != TOK_CONTINUE) {
+        emit_source_loc(s);
+        emit_op(s, OP_debug_sentinel);
+    }
+
     switch(tok = s->token.val) {
     case '{':
         if (js_parse_block(s))
@@ -30069,9 +30616,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
 
     case TOK_DEBUGGER:
-        /* currently no debugger, so just skip the keyword */
         if (next_token(s))
             goto fail;
+        if (s->cur_func->has_debug_info) {
+            emit_source_loc(s);
+            emit_op(s, OP_debug_sentinel);
+        }
         if (js_parse_expect_semi(s))
             goto fail;
         break;
@@ -32616,6 +33166,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
         list_add_tail(&fd->link, &parent->child_list);
         fd->is_strict_mode = parent->is_strict_mode;
         fd->parent_scope_level = parent->scope_level;
+        fd->has_debug_info = parent->has_debug_info;
     }
 
     fd->is_eval = is_eval;
@@ -35496,6 +36047,27 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             col_num = get_u32(bc_buf + pos + 5);
             break;
 
+        case OP_debug_sentinel:
+            /* breakpoint sentinel: record bp_site and emit to output */
+            if (s->has_debug_info && s->bp_site_count < 65535) {
+                /* grow bp_sites array if needed */
+                if (s->bp_site_count >= s->bp_site_size) {
+                    int new_size = s->bp_site_size ? s->bp_site_size * 2 : 16;
+                    struct BPSite *new_arr = js_realloc(s->ctx, s->bp_sites,
+                        new_size * sizeof(struct BPSite));
+                    if (!new_arr) goto fail;
+                    s->bp_sites = new_arr;
+                    s->bp_site_size = new_size;
+                }
+                s->bp_sites[s->bp_site_count].bytecode_offset = bc_out.size;
+                s->bp_sites[s->bp_site_count].line = line_num;
+                s->bp_sites[s->bp_site_count].col = col_num;
+                s->bp_site_count++;
+            }
+            add_pc2line_info(s, bc_out.size, line_num, col_num);
+            dbuf_putc(&bc_out, OP_debug_sentinel);
+            break;
+
         case OP_label:
             {
                 label = get_u32(bc_buf + pos + 1);
@@ -36594,7 +37166,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     struct list_head *el, *el1;
     int stack_size, scope, idx;
     int function_size, byte_code_offset, cpool_offset;
-    int closure_var_offset, vardefs_offset;
+    int closure_var_offset, vardefs_offset, bp_sites_offset;
 
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
@@ -36694,6 +37266,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     function_size += fd->closure_var_count * sizeof(*fd->closure_var);
     byte_code_offset = function_size;
     function_size += fd->byte_code.size;
+    bp_sites_offset = function_size;
+    function_size += fd->bp_site_count * sizeof(*b->bp_sites);
 
     b = js_mallocz(ctx, function_size);
     if (!b)
@@ -36768,7 +37342,17 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->super_allowed = fd->super_allowed;
     b->arguments_allowed = fd->arguments_allowed;
     b->backtrace_barrier = fd->backtrace_barrier;
+    b->has_debug_info = fd->has_debug_info;
     b->realm = JS_DupContext(ctx);
+
+    /* breakpoint sites */
+    b->bp_site_count = fd->bp_site_count;
+    if (fd->bp_site_count > 0) {
+        b->bp_sites = (void *)((uint8_t*)b + bp_sites_offset);
+        memcpy(b->bp_sites, fd->bp_sites, fd->bp_site_count * sizeof(*b->bp_sites));
+    }
+    js_free(ctx, fd->bp_sites);
+    fd->bp_sites = NULL;
 
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
 
@@ -37831,6 +38415,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fd->eval_type = eval_type;
     fd->has_this_binding = (eval_type != JS_EVAL_TYPE_DIRECT);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
+    fd->has_debug_info = ((flags & JS_EVAL_FLAG_DEBUG_INFO) != 0);
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         fd->new_target_allowed = b->new_target_allowed;
         fd->super_call_allowed = b->super_call_allowed;

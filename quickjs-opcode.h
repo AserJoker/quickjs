@@ -269,6 +269,7 @@ DEF(using_dispose_async, 3, 0, 1, loc)
 DEF(using_dispose_merge, 1, 2, 1, none)
 DEF(  using_dispose_end, 1, 1, 0, none)
 DEF(        using_check, 2, 1, 2, u8)
+DEF(  debug_sentinel, 1, 0, 0, none) /* breakpoint sentinel: check debug state, no stack effect */
 /* must be the last non short and non temporary opcode */
 DEF(            nop, 1, 0, 0, none)
 

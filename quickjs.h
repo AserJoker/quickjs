@@ -461,6 +461,9 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* emit debug info: breakpoint sentinels and breakpoint site table.
+   Needed for CDP debugging support. */
+#define JS_EVAL_FLAG_DEBUG_INFO (1 << 9)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -1439,6 +1442,120 @@ JS_EXTERN const char* JS_GetVersion(void);
 
 /* Integration point for quickjs-libc.c, not for public use. */
 JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
+
+/* ---- Debug API ---- */
+
+/* Debug state values (for JSRuntime.debug_state) */
+#define JS_DEBUG_RUNNING   0
+#define JS_DEBUG_PAUSING   1  /* pause requested, waiting for next sentinel */
+#define JS_DEBUG_PAUSED    2  /* execution is paused */
+#define JS_DEBUG_STEPPING  3  /* stepping through code */
+
+/* Debug event types */
+typedef enum {
+    JS_DEBUG_EVENT_BREAKPOINT_HIT,  /* hit a user-set breakpoint */
+    JS_DEBUG_EVENT_STEP_COMPLETE,   /* step operation completed */
+    JS_DEBUG_EVENT_DEBUGGER_STMT,   /* debugger; statement encountered */
+} JSDebugEventType;
+
+/* Debug event callback. Called on the script thread when a debug event occurs.
+   The callback should not block; it should signal the debug server and return.
+   The engine will then enter a paused loop calling debug_drain_queue. */
+typedef void JSDebugCallback(JSRuntime *rt, JSDebugEventType event,
+                             const char *filename, int line, int col,
+                             void *opaque);
+
+/* Set the debug event callback */
+JS_EXTERN void JS_SetDebugCallback(JSRuntime *rt, JSDebugCallback *cb, void *opaque);
+
+/* Set the drain-queue function, called while the engine is paused to process
+   incoming debug commands (set breakpoints, evaluate expressions, etc.) */
+JS_EXTERN void JS_SetDebugDrainQueue(JSRuntime *rt, void (*drain)(void *opaque));
+
+/* --- Pause / Continue / Step --- */
+
+/* Request a pause at the next sentinel */
+JS_EXTERN void JS_DebugPause(JSRuntime *rt);
+
+/* Resume execution from a paused state */
+JS_EXTERN void JS_DebugContinue(JSRuntime *rt);
+
+/* Step: kind = 0 (into), 1 (over), 2 (out) */
+JS_EXTERN void JS_DebugStep(JSRuntime *rt, int kind);
+
+/* Query current debug state (returns JS_DEBUG_* value) */
+JS_EXTERN int JS_DebugGetState(JSRuntime *rt);
+
+/* --- Breakpoint management --- */
+
+/* Set a breakpoint by filename + line. Returns breakpoint ID (1+) or 0 on error.
+   The line number will be corrected to the nearest valid breakpoint site. */
+JS_EXTERN uint32_t JS_DebugSetBreakpoint(JSRuntime *rt, const char *filename, int line);
+
+/* Remove a breakpoint by ID. Returns 0 on success, -1 if not found. */
+JS_EXTERN int JS_DebugRemoveBreakpoint(JSRuntime *rt, uint32_t id);
+
+/* Remove all breakpoints */
+JS_EXTERN void JS_DebugClearBreakpoints(JSRuntime *rt);
+
+/* --- Stack frame inspection --- */
+
+typedef struct JSDebugFrameInfo {
+    char *func_name;  /* function name (malloc'd, caller must free) */
+    char *filename;   /* source filename (malloc'd, caller must free) */
+    int line;
+    int col;
+    int is_native;    /* 1 if native function, 0 if bytecode */
+} JSDebugFrameInfo;
+
+/* Capture current call stack. Returns frame count, or -1 on error.
+   *pframes is set to a malloc'd array. Caller must free with JS_DebugFreeFrameInfo. */
+JS_EXTERN int JS_DebugCaptureStack(JSRuntime *rt, JSDebugFrameInfo **pframes);
+
+/* Free frame info array */
+JS_EXTERN void JS_DebugFreeFrameInfo(JSRuntime *rt, JSDebugFrameInfo *frames, int count);
+
+/* --- Variable inspection --- */
+
+typedef struct JSDebugVarInfo {
+    char *name;       /* variable name (malloc'd, caller must free) */
+    JSValue value;    /* current value (caller must JS_FreeValue) */
+    int is_arg;       /* 1 if function argument */
+    int is_const;     /* 1 if const */
+    int is_lexical;   /* 1 if let/const (vs var) */
+    int is_captured;  /* 1 if captured by closure */
+} JSDebugVarInfo;
+
+/* Get local variables for a given stack frame index (0 = topmost).
+   Returns variable count, or -1 on error.
+   *pvars is set to a malloc'd array. Caller must free with JS_DebugFreeVarInfo. */
+JS_EXTERN int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
+                                      JSDebugVarInfo **pvars);
+
+/* Free variable info array (frees names and values) */
+JS_EXTERN void JS_DebugFreeVarInfo(JSContext *ctx, JSDebugVarInfo *vars, int count);
+
+/* --- Breakpoint site query --- */
+
+typedef struct JSDebugBPSite {
+    uint32_t offset;  /* bytecode offset */
+    int line;
+    int col;
+} JSDebugBPSite;
+
+/* Get breakpoint sites for a given script filename.
+   Returns site count, or -1 on error.
+   *psites is set to a malloc'd array. Caller must free with js_free(ctx, ...). */
+JS_EXTERN int JS_DebugGetBreakpointSites(JSContext *ctx, const char *filename,
+                                          JSDebugBPSite **psites);
+
+/* --- Evaluation in context --- */
+
+/* Evaluate an expression in the context of a paused frame.
+   Returns the result as a JSValue. The caller must JS_FreeValue it.
+   Returns JS_EXCEPTION on error. */
+JS_EXTERN JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
+                                            const char *expr);
 
 #ifdef __cplusplus
 } /* extern "C" { */
