@@ -1453,17 +1453,21 @@ JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 
 /* Debug event types */
 typedef enum {
-    JS_DEBUG_EVENT_BREAKPOINT_HIT,  /* hit a user-set breakpoint */
-    JS_DEBUG_EVENT_STEP_COMPLETE,   /* step operation completed */
-    JS_DEBUG_EVENT_DEBUGGER_STMT,   /* debugger; statement encountered */
+    JS_DEBUG_EVENT_BREAKPOINT_HIT,     /* hit a user-set breakpoint */
+    JS_DEBUG_EVENT_STEP_COMPLETE,      /* step operation completed */
+    JS_DEBUG_EVENT_DEBUGGER_STMT,      /* debugger; statement encountered */
+    JS_DEBUG_EVENT_EXCEPTION,          /* exception thrown */
+    JS_DEBUG_EVENT_UNCAUGHT_EXCEPTION, /* exception not caught */
 } JSDebugEventType;
 
 /* Debug event callback. Called on the script thread when a debug event occurs.
    The callback should not block; it should signal the debug server and return.
-   The engine will then enter a paused loop calling debug_drain_queue. */
+   The engine will then enter a paused loop calling debug_drain_queue.
+   bp_id is the breakpoint ID that was hit, or 0 if the event is not a
+   breakpoint hit. */
 typedef void JSDebugCallback(JSRuntime *rt, JSDebugEventType event,
                              const char *filename, int line, int col,
-                             void *opaque);
+                             uint32_t bp_id, void *opaque);
 
 /* Set the debug event callback */
 JS_EXTERN void JS_SetDebugCallback(JSRuntime *rt, JSDebugCallback *cb, void *opaque);
@@ -1492,11 +1496,21 @@ JS_EXTERN int JS_DebugGetState(JSRuntime *rt);
    The line number will be corrected to the nearest valid breakpoint site. */
 JS_EXTERN uint32_t JS_DebugSetBreakpoint(JSRuntime *rt, const char *filename, int line);
 
+/* Set a conditional breakpoint by filename + line with a condition expression.
+   Returns breakpoint ID (1+) or 0 on error. The condition is evaluated each
+   time the line is hit; the breakpoint only fires when the condition is truthy. */
+JS_EXTERN uint32_t JS_DebugSetConditionalBreakpoint(JSRuntime *rt, const char *filename,
+                                                     int line, const char *condition);
+
 /* Remove a breakpoint by ID. Returns 0 on success, -1 if not found. */
 JS_EXTERN int JS_DebugRemoveBreakpoint(JSRuntime *rt, uint32_t id);
 
 /* Remove all breakpoints */
 JS_EXTERN void JS_DebugClearBreakpoints(JSRuntime *rt);
+
+/* Set whether to pause on exceptions.
+   state: 0 = don't pause, 1 = pause on uncaught, 2 = pause on all */
+JS_EXTERN void JS_DebugSetPauseOnExceptions(JSRuntime *rt, int state);
 
 /* --- Stack frame inspection --- */
 
@@ -1535,6 +1549,24 @@ JS_EXTERN int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
 /* Free variable info array (frees names and values) */
 JS_EXTERN void JS_DebugFreeVarInfo(JSContext *ctx, JSDebugVarInfo *vars, int count);
 
+/* --- Scope chain inspection --- */
+
+typedef struct JSDebugScopeInfo {
+    char *name;       /* scope name (e.g. "Block", "Catch", "With", "Global"), malloc'd */
+    int scope_level;  /* lexical nesting level */
+    int var_start;    /* index into JSDebugVarInfo array for this scope's first var */
+    int var_count;    /* number of variables in this scope */
+} JSDebugScopeInfo;
+
+/* Get scope chain for a given stack frame index (0 = topmost).
+   Returns scope count, or -1 on error.
+   *pscopes is set to a malloc'd array. Caller must free with JS_DebugFreeScopeInfo. */
+JS_EXTERN int JS_DebugGetFrameScopes(JSRuntime *rt, int frame_index,
+                                      JSDebugScopeInfo **pscopes);
+
+/* Free scope info array */
+JS_EXTERN void JS_DebugFreeScopeInfo(JSRuntime *rt, JSDebugScopeInfo *scopes, int count);
+
 /* --- Breakpoint site query --- */
 
 typedef struct JSDebugBPSite {
@@ -1553,9 +1585,33 @@ JS_EXTERN int JS_DebugGetBreakpointSites(JSContext *ctx, const char *filename,
 
 /* Evaluate an expression in the context of a paused frame.
    Returns the result as a JSValue. The caller must JS_FreeValue it.
-   Returns JS_EXCEPTION on error. */
+   Returns JS_EXCEPTION on error.
+   NOTE: This evaluates in the global scope only; for frame-scoped eval
+   use JS_DebugEvaluateOnFrameScoped. */
 JS_EXTERN JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
                                             const char *expr);
+
+/* Evaluate an expression in the lexical scope of a paused frame.
+   Local variables from the frame are visible during evaluation.
+   Returns the result as a JSValue. The caller must JS_FreeValue it.
+   Returns JS_EXCEPTION on error. */
+JS_EXTERN JSValue JS_DebugEvaluateOnFrameScoped(JSRuntime *rt, int frame_index,
+                                                  const char *expr);
+
+/* --- Script enumeration --- */
+
+typedef struct JSDebugScriptInfo {
+    char *filename;      /* source filename (malloc'd, caller must free) */
+    int line_count;      /* number of lines in the source */
+    int source_length;   /* length of source in bytes */
+} JSDebugScriptInfo;
+
+/* Get list of all loaded scripts. Returns script count, or -1 on error.
+   *pscripts is set to a malloc'd array. Caller must free with JS_DebugFreeScriptInfo. */
+JS_EXTERN int JS_DebugGetLoadedScripts(JSRuntime *rt, JSDebugScriptInfo **pscripts);
+
+/* Free script info array */
+JS_EXTERN void JS_DebugFreeScriptInfo(JSRuntime *rt, JSDebugScriptInfo *scripts, int count);
 
 #ifdef __cplusplus
 } /* extern "C" { */

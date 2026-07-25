@@ -321,6 +321,26 @@ typedef struct JSValueLink {
     JSValueConst value;
 } JSValueLink;
 
+/* Debug scope/call tracking types — used by JSRuntime and debug bytecodes */
+typedef struct JSDebugScopeVar {
+    JSAtom name;
+    uint8_t kind;      /* 0=arg, 1=local */
+    uint16_t idx;      /* kind==0: arg_buf[idx], kind==1: var_buf[idx] */
+} JSDebugScopeVar;
+
+typedef struct JSDebugScope {
+    int scope_level;
+    JSDebugScopeVar *vars;
+    int var_count;
+    int var_size;
+} JSDebugScope;
+
+typedef struct JSDebugCallFrame {
+    JSAtom func_name;
+    uint16_t arg_count;
+    int scope_depth;   /* debug_scopes count at time of push */
+} JSDebugCallFrame;
+
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -379,17 +399,44 @@ struct JSRuntime {
     struct JSDbgBreakpoint {
         uint32_t id;
         JSAtom filename;
-        int line;
+        int line;           /* actual line (may be snapped to sentinel position) */
+        int original_line;  /* line requested by user, used for forward matching */
         int hit_count;
+        char *condition;  /* NULL for unconditional, else JS expression string */
     } *debug_breakpoints;
     int debug_breakpoint_count;
     int debug_breakpoint_size;
     uint32_t debug_next_bp_id;
     uint8_t debug_breakpoint_set; /* optimization: 1 if any breakpoints exist */
+    uint32_t debug_pending_bp_id; /* bp_id of the last hit breakpoint (for callback) */
 
     /* step state */
     int debug_step_kind;       /* 0=into, 1=over, 2=out */
     int debug_step_target_depth;
+
+    /* exception breakpoint state: 0=off, 1=uncaught, 2=all */
+    uint8_t debug_pause_on_exceptions;
+
+    /* suppress debug events during internal eval (e.g. evaluate on frame,
+       conditional breakpoint eval). Prevents re-entrancy deadlocks. */
+    uint8_t debug_suppress;
+
+    /* loaded script tracking */
+    struct JSDbgScriptEntry {
+        JSAtom filename;
+        int line_count;
+        int source_length;
+    } *debug_loaded_scripts;
+    int debug_loaded_script_count;
+    int debug_loaded_script_size;
+
+    /* debug scope/call tracking — maintained by OP_debug_info bytecodes */
+    struct JSDebugScope *debug_scopes;
+    int debug_scope_count;
+    int debug_scope_size;
+    struct JSDebugCallFrame *debug_call_stack;
+    int debug_call_stack_count;
+    int debug_call_stack_size;
 
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
@@ -2660,12 +2707,46 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     /* free debug breakpoints */
     if (rt->debug_breakpoints) {
-        for(i = 0; i < rt->debug_breakpoint_count; i++)
+        for(i = 0; i < rt->debug_breakpoint_count; i++) {
             JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+            js_free_rt(rt, rt->debug_breakpoints[i].condition);
+        }
         js_free_rt(rt, rt->debug_breakpoints);
         rt->debug_breakpoints = NULL;
         rt->debug_breakpoint_count = 0;
         rt->debug_breakpoint_set = 0;
+    }
+
+    /* free loaded script tracking */
+    if (rt->debug_loaded_scripts) {
+        for(i = 0; i < rt->debug_loaded_script_count; i++)
+            JS_FreeAtomRT(rt, rt->debug_loaded_scripts[i].filename);
+        js_free_rt(rt, rt->debug_loaded_scripts);
+        rt->debug_loaded_scripts = NULL;
+        rt->debug_loaded_script_count = 0;
+        rt->debug_loaded_script_size = 0;
+    }
+
+    /* free debug scope tracking */
+    if (rt->debug_scopes) {
+        for(i = 0; i < rt->debug_scope_count; i++) {
+            int j;
+            for(j = 0; j < rt->debug_scopes[i].var_count; j++)
+                JS_FreeAtomRT(rt, rt->debug_scopes[i].vars[j].name);
+            js_free_rt(rt, rt->debug_scopes[i].vars);
+        }
+        js_free_rt(rt, rt->debug_scopes);
+        rt->debug_scopes = NULL;
+        rt->debug_scope_count = 0;
+        rt->debug_scope_size = 0;
+    }
+    if (rt->debug_call_stack) {
+        for(i = 0; i < rt->debug_call_stack_count; i++)
+            JS_FreeAtomRT(rt, rt->debug_call_stack[i].func_name);
+        js_free_rt(rt, rt->debug_call_stack);
+        rt->debug_call_stack = NULL;
+        rt->debug_call_stack_count = 0;
+        rt->debug_call_stack_size = 0;
     }
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -8246,7 +8327,9 @@ uint32_t JS_DebugSetBreakpoint(JSRuntime *rt, const char *filename, int line)
     bp->id = ++rt->debug_next_bp_id;
     bp->filename = atom;
     bp->line = line;
+    bp->original_line = line;
     bp->hit_count = 0;
+    bp->condition = NULL;
 
     rt->debug_breakpoint_set = 1;
     return bp->id;
@@ -8258,6 +8341,7 @@ int JS_DebugRemoveBreakpoint(JSRuntime *rt, uint32_t id)
     for (i = 0; i < rt->debug_breakpoint_count; i++) {
         if (rt->debug_breakpoints[i].id == id) {
             JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+            js_free_rt(rt, rt->debug_breakpoints[i].condition);
             /* shift remaining entries */
             memmove(&rt->debug_breakpoints[i], &rt->debug_breakpoints[i + 1],
                     (rt->debug_breakpoint_count - i - 1) * sizeof(struct JSDbgBreakpoint));
@@ -8273,8 +8357,10 @@ int JS_DebugRemoveBreakpoint(JSRuntime *rt, uint32_t id)
 void JS_DebugClearBreakpoints(JSRuntime *rt)
 {
     int i;
-    for (i = 0; i < rt->debug_breakpoint_count; i++)
+    for (i = 0; i < rt->debug_breakpoint_count; i++) {
         JS_FreeAtomRT(rt, rt->debug_breakpoints[i].filename);
+        js_free_rt(rt, rt->debug_breakpoints[i].condition);
+    }
     js_free_rt(rt, rt->debug_breakpoints);
     rt->debug_breakpoints = NULL;
     rt->debug_breakpoint_count = 0;
@@ -8289,10 +8375,122 @@ static int check_breakpoint_hit(JSRuntime *rt, JSAtom filename, int line)
         if (rt->debug_breakpoints[i].filename == filename &&
             rt->debug_breakpoints[i].line == line) {
             rt->debug_breakpoints[i].hit_count++;
+            rt->debug_pending_bp_id = rt->debug_breakpoints[i].id;
             return rt->debug_breakpoints[i].id;
         }
     }
     return 0;
+}
+
+/* --- Debug info sub-opcodes for OP_debug_info --- */
+#define JS_DEBUG_INFO_SCOPE_ENTER  0  /* +u16 scope_level */
+#define JS_DEBUG_INFO_SCOPE_LEAVE  1  /* +u16 scope_level */
+#define JS_DEBUG_INFO_VAR_DECL     2  /* +atom name +u16 kind<<15|idx */
+#define JS_DEBUG_INFO_FUNC_ENTER   3  /* +atom func_name +u16 arg_count */
+#define JS_DEBUG_INFO_FUNC_LEAVE   4  /* (no extra operands) */
+
+/* Return the total byte size of an OP_debug_info instruction including
+   the opcode byte, sub-opcode byte, and sub-opcode-specific operands. */
+static int debug_info_size(const uint8_t *pc)
+{
+    switch (pc[1]) { /* sub-opcode follows the OP_debug_info byte */
+    case JS_DEBUG_INFO_SCOPE_ENTER:
+    case JS_DEBUG_INFO_SCOPE_LEAVE:
+        return 2 + 2; /* opcode + sub + u16 */
+    case JS_DEBUG_INFO_VAR_DECL:
+    case JS_DEBUG_INFO_FUNC_ENTER:
+        return 2 + 4 + 2; /* opcode + sub + atom + u16 */
+    case JS_DEBUG_INFO_FUNC_LEAVE:
+        return 2; /* opcode + sub only */
+    default:
+        return 2; /* unknown sub-type: skip opcode + sub byte */
+    }
+}
+
+/* --- Debug scope/call tracking helpers --- */
+
+static void dbg_scope_push(JSRuntime *rt, int scope_level)
+{
+    if (rt->debug_scope_count >= rt->debug_scope_size) {
+        int new_size = rt->debug_scope_size ? rt->debug_scope_size * 2 : 8;
+        struct JSDebugScope *new_arr = js_realloc_rt(rt, rt->debug_scopes,
+            new_size * sizeof(struct JSDebugScope));
+        if (!new_arr) return;
+        rt->debug_scopes = new_arr;
+        rt->debug_scope_size = new_size;
+    }
+    struct JSDebugScope *scope = &rt->debug_scopes[rt->debug_scope_count++];
+    scope->scope_level = scope_level;
+    scope->vars = NULL;
+    scope->var_count = 0;
+    scope->var_size = 0;
+}
+
+static void dbg_scope_pop(JSRuntime *rt, int scope_level)
+{
+    while (rt->debug_scope_count > 0 &&
+           rt->debug_scopes[rt->debug_scope_count - 1].scope_level >= scope_level) {
+        struct JSDebugScope *scope = &rt->debug_scopes[rt->debug_scope_count - 1];
+        int i;
+        for (i = 0; i < scope->var_count; i++)
+            JS_FreeAtomRT(rt, scope->vars[i].name);
+        js_free_rt(rt, scope->vars);
+        rt->debug_scope_count--;
+    }
+}
+
+static void dbg_scope_add_var(JSRuntime *rt, JSAtom name, uint16_t kind_and_idx)
+{
+    struct JSDebugScope *scope;
+    struct JSDebugScopeVar *v;
+    if (rt->debug_scope_count == 0) return;
+    scope = &rt->debug_scopes[rt->debug_scope_count - 1];
+    if (scope->var_count >= scope->var_size) {
+        int new_size = scope->var_size ? scope->var_size * 2 : 4;
+        struct JSDebugScopeVar *new_arr = js_realloc_rt(rt, scope->vars,
+            new_size * sizeof(struct JSDebugScopeVar));
+        if (!new_arr) return;
+        scope->vars = new_arr;
+        scope->var_size = new_size;
+    }
+    v = &scope->vars[scope->var_count++];
+    v->name = JS_DupAtomRT(rt, name);
+    v->kind = (kind_and_idx >> 15) & 1;
+    v->idx = kind_and_idx & 0x7FFF;
+}
+
+static void dbg_call_stack_push(JSRuntime *rt, JSAtom func_name, uint16_t arg_count)
+{
+    if (rt->debug_call_stack_count >= rt->debug_call_stack_size) {
+        int new_size = rt->debug_call_stack_size ? rt->debug_call_stack_size * 2 : 8;
+        struct JSDebugCallFrame *new_arr = js_realloc_rt(rt, rt->debug_call_stack,
+            new_size * sizeof(struct JSDebugCallFrame));
+        if (!new_arr) return;
+        rt->debug_call_stack = new_arr;
+        rt->debug_call_stack_size = new_size;
+    }
+    struct JSDebugCallFrame *frame = &rt->debug_call_stack[rt->debug_call_stack_count++];
+    frame->func_name = JS_DupAtomRT(rt, func_name);
+    frame->arg_count = arg_count;
+    frame->scope_depth = rt->debug_scope_count;
+}
+
+static void dbg_call_stack_pop(JSRuntime *rt)
+{
+    if (rt->debug_call_stack_count > 0) {
+        struct JSDebugCallFrame *frame = &rt->debug_call_stack[rt->debug_call_stack_count - 1];
+        /* pop all scopes that were pushed within this function */
+        while (rt->debug_scope_count > frame->scope_depth) {
+            struct JSDebugScope *scope = &rt->debug_scopes[rt->debug_scope_count - 1];
+            int i;
+            for (i = 0; i < scope->var_count; i++)
+                JS_FreeAtomRT(rt, scope->vars[i].name);
+            js_free_rt(rt, scope->vars);
+            rt->debug_scope_count--;
+        }
+        JS_FreeAtomRT(rt, frame->func_name);
+        rt->debug_call_stack_count--;
+    }
 }
 
 int JS_DebugCaptureStack(JSRuntime *rt, JSDebugFrameInfo **pframes)
@@ -8566,12 +8764,384 @@ JSValue JS_DebugEvaluateOnFrame(JSRuntime *rt, int frame_index,
     /* Evaluate the expression in the context of the frame's realm.
        We use JS_Eval with the global object and EVAL_TYPE_GLOBAL + DEBUG_INFO.
        For now, this is a simple eval; full scope chain evaluation would require
-       reconstructing the variable environment which is complex. */
-    return JS_Eval(ctx, expr, strlen(expr), "<debug-eval>",
-                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_DEBUG_INFO);
+       reconstructing the variable environment which is complex.
+       Suppress all debug events during eval to prevent re-entering the
+       debug callback while already paused (would cause deadlock). */
+    rt->debug_suppress++;
+    JSValue result = JS_Eval(ctx, expr, strlen(expr), "<debug-eval>",
+                             JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_DEBUG_INFO);
+    rt->debug_suppress--;
+    return result;
 }
 
-/* Note: it is important that no exception is returned by this function */
+/* --- Frame-scoped evaluation --- */
+
+JSValue JS_DebugEvaluateOnFrameScoped(JSRuntime *rt, int frame_index,
+                                       const char *expr)
+{
+    JSStackFrame *sf;
+    JSContext *ctx;
+    JSFunctionBytecode *b;
+    int i, frame_count;
+    JSValue global_obj, result;
+    JSDebugVarInfo *vars = NULL;
+    int var_count;
+    /* saved values for restoration after eval */
+    JSValue *saved_vals = NULL;
+    JSAtom *saved_names = NULL;
+    int saved_count = 0;
+
+    if (list_empty(&rt->context_list))
+        return JS_EXCEPTION;
+    ctx = list_entry(rt->context_list.next, JSContext, link);
+
+    /* walk to the requested frame */
+    frame_count = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        frame_count++;
+
+    if (frame_index < 0 || frame_index >= frame_count)
+        return JS_ThrowReferenceError(ctx, "invalid frame index %d", frame_index);
+
+    sf = rt->current_stack_frame;
+    for (i = 0; i < frame_index; i++)
+        sf = sf->prev_frame;
+
+    b = dbg_get_bytecode(sf->cur_func);
+    if (!b || !b->realm)
+        return JS_ThrowTypeError(ctx, "cannot evaluate in native frame");
+
+    ctx = b->realm;
+    global_obj = JS_GetGlobalObject(ctx);
+
+    /* Get frame locals and inject them as temporary properties on the global object */
+    var_count = JS_DebugGetFrameLocals(rt, frame_index, &vars);
+    if (var_count > 0) {
+        saved_vals = (JSValue *)js_malloc_rt(rt, var_count * sizeof(JSValue));
+        saved_names = (JSAtom *)js_malloc_rt(rt, var_count * sizeof(JSAtom));
+        if (!saved_vals || !saved_names) {
+            JS_DebugFreeVarInfo(ctx, vars, var_count);
+            js_free_rt(rt, saved_vals);
+            js_free_rt(rt, saved_names);
+            JS_FreeValue(ctx, global_obj);
+            return JS_EXCEPTION;
+        }
+        for (i = 0; i < var_count; i++) {
+            JSAtom name_atom;
+            const char *var_name = vars[i].name;
+            if (!var_name) continue;
+            name_atom = JS_NewAtom(ctx, var_name);
+            saved_names[saved_count] = name_atom;
+            /* save existing property value (or mark as absent) */
+            if (JS_HasProperty(ctx, global_obj, name_atom)) {
+                saved_vals[saved_count] = JS_GetProperty(ctx, global_obj, name_atom);
+            } else {
+                saved_vals[saved_count] = JS_UNINITIALIZED;
+            }
+            /* inject frame local value */
+            JS_SetProperty(ctx, global_obj, name_atom,
+                           JS_DupValueRT(rt, vars[i].value));
+            saved_count++;
+        }
+    }
+
+    /* Evaluate the expression — locals are now visible via global object.
+       Suppress all debug events during eval to prevent re-entering the
+       debug callback while already paused (would cause deadlock). */
+    rt->debug_suppress++;
+    result = JS_Eval(ctx, expr, strlen(expr), "<debug-eval>",
+                     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_DEBUG_INFO);
+    rt->debug_suppress--;
+
+    /* Restore global object: remove injected properties, restore saved ones */
+    for (i = 0; i < saved_count; i++) {
+        if (JS_IsUninitialized(saved_vals[i])) {
+            /* property didn't exist before — delete it */
+            JS_DeleteProperty(ctx, global_obj, saved_names[i],
+                              JS_PROP_THROW_STRICT);
+        } else {
+            /* restore original value */
+            JS_SetProperty(ctx, global_obj, saved_names[i], saved_vals[i]);
+        }
+        JS_FreeAtom(ctx, saved_names[i]);
+    }
+    js_free_rt(rt, saved_vals);
+    js_free_rt(rt, saved_names);
+
+    if (vars)
+        JS_DebugFreeVarInfo(ctx, vars, var_count);
+    JS_FreeValue(ctx, global_obj);
+
+    return result;
+}
+
+/* --- Conditional breakpoints --- */
+
+uint32_t JS_DebugSetConditionalBreakpoint(JSRuntime *rt, const char *filename,
+                                           int line, const char *condition)
+{
+    uint32_t id;
+    id = JS_DebugSetBreakpoint(rt, filename, line);
+    if (id == 0)
+        return 0;
+    /* find the breakpoint we just created and set its condition */
+    {
+        int i;
+        for (i = 0; i < rt->debug_breakpoint_count; i++) {
+            if (rt->debug_breakpoints[i].id == id) {
+                char *cond_copy = dbg_strdup_rt(rt, condition);
+                if (!cond_copy) {
+                    JS_DebugRemoveBreakpoint(rt, id);
+                    return 0;
+                }
+                rt->debug_breakpoints[i].condition = cond_copy;
+                break;
+            }
+        }
+    }
+    return id;
+}
+
+/* --- Exception breakpoints --- */
+
+void JS_DebugSetPauseOnExceptions(JSRuntime *rt, int state)
+{
+    rt->debug_pause_on_exceptions = (uint8_t)state;
+}
+
+/* --- Scope chain inspection --- */
+
+int JS_DebugGetFrameScopes(JSRuntime *rt, int frame_index,
+                            JSDebugScopeInfo **pscopes)
+{
+    JSStackFrame *sf;
+    int i, frame_count, scope_count;
+    int scope_start, scope_end;
+    JSDebugScopeInfo *scopes;
+    JSDebugVarInfo *vars = NULL;
+    int var_count;
+
+    /* walk to the requested frame */
+    frame_count = 0;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        frame_count++;
+
+    if (frame_index < 0 || frame_index >= frame_count) {
+        *pscopes = NULL;
+        return -1;
+    }
+
+    /* determine scope range for this frame using debug_call_stack */
+    /* frame 0 (topmost) = last entry in debug_call_stack */
+    {
+        int call_idx = rt->debug_call_stack_count - 1 - frame_index;
+        int next_call_depth;
+
+        if (call_idx < 0) {
+            *pscopes = NULL;
+            return 0;
+        }
+
+        scope_start = rt->debug_call_stack[call_idx].scope_depth;
+        if (call_idx + 1 < rt->debug_call_stack_count)
+            next_call_depth = rt->debug_call_stack[call_idx + 1].scope_depth;
+        else
+            next_call_depth = rt->debug_scope_count;
+        scope_end = next_call_depth;
+        scope_count = scope_end - scope_start;
+    }
+
+    if (scope_count <= 0) {
+        *pscopes = NULL;
+        return 0;
+    }
+
+    scopes = (JSDebugScopeInfo *)js_malloc_rt(rt, scope_count * sizeof(JSDebugScopeInfo));
+    if (!scopes) {
+        *pscopes = NULL;
+        return -1;
+    }
+    memset(scopes, 0, scope_count * sizeof(JSDebugScopeInfo));
+
+    /* get frame locals to compute var_start/var_count per scope */
+    var_count = JS_DebugGetFrameLocals(rt, frame_index, &vars);
+
+    {
+        int var_idx = 0;
+        for (i = 0; i < scope_count; i++) {
+            struct JSDebugScope *ds = &rt->debug_scopes[scope_start + i];
+            int scope_var_count = 0;
+
+            /* count how many vars belong to this scope */
+            if (vars) {
+                int j;
+                for (j = var_idx; j < var_count; j++) {
+                    /* Check if this variable's kind/idx maps to this scope.
+                       We use a simplified approach: map scope vars to flat var list
+                       by matching variable names. */
+                    int k;
+                    for (k = 0; k < ds->var_count; k++) {
+                        const char *vn;
+                        if (!list_empty(&rt->context_list)) {
+                            JSContext *ctx = list_entry(rt->context_list.next, JSContext, link);
+                            vn = JS_AtomToCString(ctx, ds->vars[k].name);
+                            if (vn && vars[j].name && strcmp(vn, vars[j].name) == 0)
+                                scope_var_count++;
+                            JS_FreeCString(ctx, vn);
+                        }
+                    }
+                }
+            }
+
+            scopes[i].name = dbg_strdup_rt(rt, "Block");
+            scopes[i].scope_level = ds->scope_level;
+            scopes[i].var_start = var_idx;
+            scopes[i].var_count = scope_var_count > 0 ? scope_var_count : ds->var_count;
+            var_idx += scopes[i].var_count;
+        }
+    }
+
+    if (vars)
+        JS_DebugFreeVarInfo(list_entry(rt->context_list.next, JSContext, link),
+                            vars, var_count);
+
+    *pscopes = scopes;
+    return scope_count;
+}
+
+void JS_DebugFreeScopeInfo(JSRuntime *rt, JSDebugScopeInfo *scopes, int count)
+{
+    int i;
+    if (!scopes) return;
+    for (i = 0; i < count; i++)
+        js_free_rt(rt, scopes[i].name);
+    js_free_rt(rt, scopes);
+}
+
+/* --- Script enumeration --- */
+
+/* After a script is compiled, correct breakpoint line numbers to the
+   nearest valid breakpoint site (OP_debug_sentinel position) in the
+   bytecode.  This handles the case where a user sets a breakpoint on
+   a line that has no sentinel (e.g. a function declaration line). */
+static void dbg_correct_breakpoint_lines(JSRuntime *rt, JSAtom filename_atom)
+{
+    struct list_head *el;
+    int bp_idx;
+
+    if (rt->debug_breakpoint_count == 0 || filename_atom == JS_ATOM_NULL)
+        return;
+
+    /* Collect all breakpoint site lines for this file */
+    /* We iterate per breakpoint to find the nearest site */
+    for (bp_idx = 0; bp_idx < rt->debug_breakpoint_count; bp_idx++) {
+        struct JSDbgBreakpoint *bp = &rt->debug_breakpoints[bp_idx];
+        int best_line = -1;
+        int best_diff = 0x7fffffff;
+
+        if (bp->filename != filename_atom)
+            continue;
+        /* If line was already corrected, skip */
+        if (bp->line != bp->original_line)
+            continue;
+
+        list_for_each(el, &rt->gc_obj_list) {
+            JSGCObjectHeader *p = list_entry(el, JSGCObjectHeader, link);
+            JSFunctionBytecode *b;
+            int i;
+            if (JS_GC_TYPE(p) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+                continue;
+            b = (JSFunctionBytecode *)p;
+            if (!b->has_debug_info || b->filename != filename_atom)
+                continue;
+            for (i = 0; i < b->bp_site_count; i++) {
+                int site_line = b->bp_sites[i].line;
+                int diff = site_line - bp->original_line;
+                /* Only consider sites at or after the requested line,
+                   and prefer the nearest one */
+                if (diff >= 0 && diff < best_diff) {
+                    best_diff = diff;
+                    best_line = site_line;
+                }
+            }
+        }
+
+        if (best_line >= 0 && best_line != bp->line) {
+            bp->line = best_line;
+        }
+    }
+}
+
+/* Register a script when it's loaded via JS_Eval with DEBUG_INFO flag */
+static void dbg_register_script(JSRuntime *rt, JSAtom filename_atom,
+                                 int line_count, int source_length)
+{
+    struct JSDbgScriptEntry *entry;
+    if (filename_atom == JS_ATOM_NULL)
+        return;
+    if (rt->debug_loaded_script_count >= rt->debug_loaded_script_size) {
+        int new_size = rt->debug_loaded_script_size ? rt->debug_loaded_script_size * 2 : 8;
+        struct JSDbgScriptEntry *new_arr;
+        new_arr = js_realloc_rt(rt, rt->debug_loaded_scripts,
+                                new_size * sizeof(struct JSDbgScriptEntry));
+        if (!new_arr) return;
+        rt->debug_loaded_scripts = new_arr;
+        rt->debug_loaded_script_size = new_size;
+    }
+    entry = &rt->debug_loaded_scripts[rt->debug_loaded_script_count++];
+    entry->filename = JS_DupAtomRT(rt, filename_atom);
+    entry->line_count = line_count;
+    entry->source_length = source_length;
+
+    /* Correct breakpoint line numbers now that bytecode is available */
+    dbg_correct_breakpoint_lines(rt, filename_atom);
+}
+
+int JS_DebugGetLoadedScripts(JSRuntime *rt, JSDebugScriptInfo **pscripts)
+{
+    JSDebugScriptInfo *scripts;
+    int count, i;
+    JSContext *ctx;
+
+    count = rt->debug_loaded_script_count;
+    if (count == 0) {
+        *pscripts = NULL;
+        return 0;
+    }
+
+    scripts = (JSDebugScriptInfo *)js_malloc_rt(rt, count * sizeof(JSDebugScriptInfo));
+    if (!scripts) {
+        *pscripts = NULL;
+        return -1;
+    }
+    memset(scripts, 0, count * sizeof(JSDebugScriptInfo));
+
+    ctx = NULL;
+    if (!list_empty(&rt->context_list))
+        ctx = list_entry(rt->context_list.next, JSContext, link);
+
+    for (i = 0; i < count; i++) {
+        const char *name = NULL;
+        if (ctx)
+            name = JS_AtomToCString(ctx, rt->debug_loaded_scripts[i].filename);
+        scripts[i].filename = name ? dbg_strdup_rt(rt, name) : dbg_strdup_rt(rt, "<unknown>");
+        if (ctx) JS_FreeCString(ctx, name);
+        scripts[i].line_count = rt->debug_loaded_scripts[i].line_count;
+        scripts[i].source_length = rt->debug_loaded_scripts[i].source_length;
+    }
+
+    *pscripts = scripts;
+    return count;
+}
+
+void JS_DebugFreeScriptInfo(JSRuntime *rt, JSDebugScriptInfo *scripts, int count)
+{
+    int i;
+    if (!scripts) return;
+    for (i = 0; i < count; i++)
+        js_free_rt(rt, scripts[i].filename);
+    js_free_rt(rt, scripts);
+}
 static bool can_add_backtrace(JSValueConst obj)
 {
     JSObject *p;
@@ -21213,6 +21783,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_nop):
             BREAK;
+        CASE(OP_debug_info):
+            /* debug info: sub-opcode in pc[0], followed by sub-opcode-specific
+               operands. SWITCH already consumed the opcode byte, pc points at
+               the sub-type byte. Only does work when debug_callback is set. */
+            {
+                uint8_t sub = pc[0];
+                if (rt->debug_callback) {
+                    switch (sub) {
+                    case JS_DEBUG_INFO_SCOPE_ENTER:
+                        dbg_scope_push(rt, get_u16(pc + 1));
+                        pc += 1 + 2; /* sub-type + u16 scope_level */
+                        break;
+                    case JS_DEBUG_INFO_SCOPE_LEAVE:
+                        dbg_scope_pop(rt, get_u16(pc + 1));
+                        pc += 1 + 2; /* sub-type + u16 scope_level */
+                        break;
+                    case JS_DEBUG_INFO_VAR_DECL:
+                        dbg_scope_add_var(rt, get_u32(pc + 1), get_u16(pc + 5));
+                        pc += 1 + 4 + 2; /* sub-type + atom + u16 kind_idx */
+                        break;
+                    case JS_DEBUG_INFO_FUNC_ENTER:
+                        dbg_call_stack_push(rt, get_u32(pc + 1), get_u16(pc + 5));
+                        pc += 1 + 4 + 2; /* sub-type + atom + u16 arg_count */
+                        break;
+                    case JS_DEBUG_INFO_FUNC_LEAVE:
+                        dbg_call_stack_pop(rt);
+                        pc += 1; /* sub-type only */
+                        break;
+                    default:
+                        pc += debug_info_size(pc - 1) - 1; /* skip unknown */
+                        break;
+                    }
+                } else {
+                    pc += debug_info_size(pc - 1) - 1; /* skip: pc-1 = opcode, -1 for SWITCH */
+                }
+            }
+            BREAK;
         CASE(OP_debug_sentinel):
             /* debug sentinel: check if the debugger wants to pause here.
                Only does work when a debug callback is installed. */
@@ -21220,6 +21827,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSDebugEventType event = (JSDebugEventType)-1;
                 int line_num, col_num;
                 const char *filename = NULL;
+
+                /* If debug events are suppressed (e.g. during evaluate on frame),
+                   skip all debug processing to prevent re-entrancy deadlocks. */
+                if (rt->debug_suppress)
+                    BREAK;
+
+                /* Update cur_pc so JS_DebugCaptureStack reports correct position */
+                sf->cur_pc = pc;
 
                 /* get current source location from pc2line */
                 {
@@ -21253,7 +21868,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* check if we hit a user-set breakpoint */
                     int bp_id = check_breakpoint_hit(rt, b->filename, line_num);
                     if (bp_id) {
-                        event = JS_DEBUG_EVENT_BREAKPOINT_HIT;
+                        /* check condition if this is a conditional breakpoint */
+                        int cond_idx;
+                        const char *cond_expr = NULL;
+                        for (cond_idx = 0; cond_idx < rt->debug_breakpoint_count; cond_idx++) {
+                            if (rt->debug_breakpoints[cond_idx].id == (uint32_t)bp_id) {
+                                cond_expr = rt->debug_breakpoints[cond_idx].condition;
+                                break;
+                            }
+                        }
+                        if (cond_expr) {
+                            /* evaluate condition in frame scope */
+                            JSValue cond_result = JS_DebugEvaluateOnFrameScoped(rt, 0, cond_expr);
+                            int cond_truthy = JS_ToBool(ctx, cond_result);
+                            JS_FreeValue(ctx, cond_result);
+                            if (cond_truthy) {
+                                event = JS_DEBUG_EVENT_BREAKPOINT_HIT;
+                            }
+                            /* else: condition false, skip this breakpoint */
+                        } else {
+                            event = JS_DEBUG_EVENT_BREAKPOINT_HIT;
+                        }
                     }
                 }
                 /* Note: debugger; statements also emit OP_debug_sentinel.
@@ -21265,11 +21900,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (event != (JSDebugEventType)-1) {
                     rt->debug_state = JS_DEBUG_PAUSED;
 
-                    /* notify the debug callback */
+                    /* notify the debug callback with bp_id */
                     {
                         JSDebugCallback *cb = (JSDebugCallback *)rt->debug_callback;
+                        uint32_t bp_id = (event == JS_DEBUG_EVENT_BREAKPOINT_HIT)
+                                         ? rt->debug_pending_bp_id : 0;
                         cb(rt, event, filename ? filename : "<unknown>",
-                           line_num, col_num, rt->debug_opaque);
+                           line_num, col_num, bp_id, rt->debug_opaque);
                     }
 
                     /* paused loop: wait for continue/step, drain queue */
@@ -21333,6 +21970,65 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    /* Exception breakpoint: check if debugger should pause on this exception.
+       We scan the value stack for JS_TAG_CATCH_OFFSET to determine if the
+       exception will be caught within this frame. */
+    if (rt->debug_callback && rt->debug_pause_on_exceptions &&
+        !rt->debug_suppress &&
+        !JS_IsUncatchableError(rt->current_exception)) {
+        int will_be_caught = 0;
+        {
+            /* Scan stack for a catch handler (JS_TAG_CATCH_OFFSET with pos != 0) */
+            JSValue *scan_sp = sp;
+            while (scan_sp > stack_buf) {
+                if (JS_VALUE_GET_TAG(scan_sp[-1]) == JS_TAG_CATCH_OFFSET) {
+                    int pos = JS_VALUE_GET_INT(scan_sp[-1]);
+                    if (pos != 0) {
+                        will_be_caught = 1;
+                        break;
+                    }
+                }
+                scan_sp--;
+            }
+        }
+        /* Decide whether to break based on pause_on_exceptions state:
+           state == 2: break on ALL exceptions (caught + uncaught)
+           state == 1: break only on UNCAUGHT exceptions */
+        int should_break = 0;
+        JSDebugEventType exc_event = (JSDebugEventType)-1;
+        if (rt->debug_pause_on_exceptions == 2) {
+            should_break = 1;
+            exc_event = will_be_caught ? JS_DEBUG_EVENT_EXCEPTION
+                                       : JS_DEBUG_EVENT_UNCAUGHT_EXCEPTION;
+        } else if (rt->debug_pause_on_exceptions == 1 && !will_be_caught) {
+            should_break = 1;
+            exc_event = JS_DEBUG_EVENT_UNCAUGHT_EXCEPTION;
+        }
+        if (should_break && exc_event != (JSDebugEventType)-1) {
+            int line_num, col_num;
+            const char *filename = NULL;
+            sf->cur_pc = pc;
+            {
+                uint32_t offset = (uint32_t)(pc - b->byte_code_buf);
+                line_num = find_line_num(ctx, b, offset, &col_num);
+                if (b->filename != JS_ATOM_NULL)
+                    filename = JS_AtomToCString(ctx, b->filename);
+            }
+            rt->debug_state = JS_DEBUG_PAUSED;
+            {
+                JSDebugCallback *cb = (JSDebugCallback *)rt->debug_callback;
+                cb(rt, exc_event, filename ? filename : "<unknown>",
+                   line_num, col_num, 0, rt->debug_opaque);
+            }
+            while (rt->debug_state == JS_DEBUG_PAUSED) {
+                if (rt->debug_drain_queue)
+                    rt->debug_drain_queue(rt->debug_opaque);
+            }
+            if (filename)
+                JS_FreeCString(ctx, filename);
+        }
+    }
+
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
@@ -24784,6 +25480,11 @@ static int push_scope(JSParseState *s) {
         fd->scopes[scope].using_label_end = -1;
         emit_op(s, OP_enter_scope);
         emit_u16(s, scope);
+        if (fd->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_SCOPE_ENTER);
+            emit_u16(s, scope);
+        }
         return fd->scope_level = scope;
     }
     return 0;
@@ -24807,6 +25508,11 @@ static void pop_scope(JSParseState *s) {
         int scope = fd->scope_level;
         emit_op(s, OP_leave_scope);
         emit_u16(s, scope);
+        if (fd->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_SCOPE_LEAVE);
+            emit_u16(s, scope);
+        }
         fd->scope_level = fd->scopes[scope].parent;
         fd->scope_first = get_first_lexical_var(fd, fd->scope_level);
     }
@@ -24817,6 +25523,11 @@ static void close_scopes(JSParseState *s, int scope, int scope_stop)
     while (scope > scope_stop) {
         emit_op(s, OP_leave_scope);
         emit_u16(s, scope);
+        if (s->cur_func->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_SCOPE_LEAVE);
+            emit_u16(s, scope);
+        }
         scope = s->cur_func->scopes[scope].parent;
     }
 }
@@ -25087,6 +25798,13 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         break;
     default:
         abort();
+    }
+    if (idx >= 0 && fd->has_debug_info && idx < GLOBAL_VAR_OFFSET) {
+        emit_source_loc(s);
+        emit_op(s, OP_debug_info);
+        emit_u8(s, JS_DEBUG_INFO_VAR_DECL);
+        emit_atom(s, name);
+        emit_u16(s, (1 << 15) | idx); /* kind=1 (local), idx in bits 0-14 */
     }
     return idx;
 }
@@ -29107,10 +29825,22 @@ static void emit_return(JSParseState *s, bool hasval)
         emit_u16(s, 0);
 
         emit_label(s, label_return);
+        if (s->cur_func->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_FUNC_LEAVE);
+        }
         emit_op(s, OP_return);
     } else if (s->cur_func->func_kind != JS_FUNC_NORMAL) {
+        if (s->cur_func->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_FUNC_LEAVE);
+        }
         emit_op(s, OP_return_async);
     } else {
+        if (s->cur_func->has_debug_info) {
+            emit_op(s, OP_debug_info);
+            emit_u8(s, JS_DEBUG_INFO_FUNC_LEAVE);
+        }
         emit_op(s, hasval ? OP_return : OP_return_undef);
     }
 }
@@ -29792,9 +30522,11 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
-    /* emit debug sentinel at the start of each statement */
+    /* emit debug sentinel at the start of each statement.
+       Exclude TOK_DEBUGGER because it emits its own sentinel in the case handler. */
     if (s->cur_func->has_debug_info &&
-        s->token.val != '{' && s->token.val != TOK_BREAK && s->token.val != TOK_CONTINUE) {
+        s->token.val != '{' && s->token.val != TOK_BREAK &&
+        s->token.val != TOK_CONTINUE && s->token.val != TOK_DEBUGGER) {
         emit_source_loc(s);
         emit_op(s, OP_debug_sentinel);
     }
@@ -33245,6 +33977,22 @@ static void free_bytecode_atoms(JSRuntime *rt,
             atom = get_u32(bc_buf + pos + 1);
             JS_FreeAtomRT(rt, atom);
             break;
+        case OP_FMT_u8:
+            /* OP_debug_info: variable-length, may contain atoms */
+            if (op == OP_debug_info && (pos + 2) <= bc_len) {
+                uint8_t sub = bc_buf[pos + 1];
+                int total = debug_info_size(bc_buf + pos);
+                if (sub == JS_DEBUG_INFO_VAR_DECL ||
+                    sub == JS_DEBUG_INFO_FUNC_ENTER) {
+                    if ((pos + 2 + 4) <= bc_len) {
+                        atom = get_u32(bc_buf + pos + 2);
+                        JS_FreeAtomRT(rt, atom);
+                    }
+                }
+                pos += total;
+                continue; /* skip the pos += len at the end */
+            }
+            break;
         default:
             break;
         }
@@ -33369,6 +34117,8 @@ static void dump_byte_code(JSContext *ctx, int pass,
         else
             oi = &opcode_info[op];
         pos_next = pos + oi->size;
+        if (op == OP_debug_info)
+            pos_next = pos + debug_info_size(tab + pos);
         if (op < OP_COUNT) {
             switch (oi->fmt) {
             case OP_FMT_label8:
@@ -33441,6 +34191,8 @@ static void dump_byte_code(JSContext *ctx, int pass,
         else
             oi = &opcode_info[op];
         size = oi->size;
+        if (op == OP_debug_info)
+            size = debug_info_size(tab + pos);
         if (pos + size > len) {
             printf("truncated opcode (0x%02x)\n", op);
             break;
@@ -33473,7 +34225,47 @@ static void dump_byte_code(JSContext *ctx, int pass,
             printf(" %d", op - OP_call0);
             break;
         case OP_FMT_u8:
-            printf(" %u", get_u8(tab + pos));
+            if (op == OP_debug_info) {
+                /* variable-length debug info: display sub-opcode and operands */
+                uint8_t sub = get_u8(tab + pos);
+                const char *sub_name;
+                switch (sub) {
+                case JS_DEBUG_INFO_SCOPE_ENTER:  sub_name = "scope_enter"; break;
+                case JS_DEBUG_INFO_SCOPE_LEAVE:  sub_name = "scope_leave"; break;
+                case JS_DEBUG_INFO_VAR_DECL:     sub_name = "var_decl"; break;
+                case JS_DEBUG_INFO_FUNC_ENTER:   sub_name = "func_enter"; break;
+                case JS_DEBUG_INFO_FUNC_LEAVE:   sub_name = "func_leave"; break;
+                default:                         sub_name = "unknown"; break;
+                }
+                printf(" %s", sub_name);
+                switch (sub) {
+                case JS_DEBUG_INFO_SCOPE_ENTER:
+                case JS_DEBUG_INFO_SCOPE_LEAVE:
+                    printf(" %u", get_u16(tab + pos + 1));
+                    break;
+                case JS_DEBUG_INFO_VAR_DECL: {
+                    JSAtom atom = get_u32(tab + pos + 1);
+                    uint16_t kind_idx = get_u16(tab + pos + 5);
+                    printf(" ");
+                    print_atom(ctx, atom);
+                    printf(" kind=%u idx=%u", kind_idx >> 15, kind_idx & 0x7FFF);
+                    break;
+                }
+                case JS_DEBUG_INFO_FUNC_ENTER: {
+                    JSAtom atom = get_u32(tab + pos + 1);
+                    uint16_t ac = get_u16(tab + pos + 5);
+                    printf(" ");
+                    print_atom(ctx, atom);
+                    printf(" arg_count=%u", ac);
+                    break;
+                }
+                case JS_DEBUG_INFO_FUNC_LEAVE:
+                    break;
+                }
+                size = debug_info_size(tab + pos - 1);
+            } else {
+                printf(" %u", get_u8(tab + pos));
+            }
             break;
         case OP_FMT_i8:
             printf(" %d", get_i8(tab + pos));
@@ -33785,8 +34577,12 @@ static __maybe_unused void js_dump_function_bytecode(JSContext *ctx, JSFunctionB
     printf("  stack_size: %d\n", b->stack_size);
     printf("  byte_code_len: %d\n", b->byte_code_len);
     op = b->byte_code_buf;
-    for (i = 0; op < &b->byte_code_buf[b->byte_code_len]; i++)
-        op += short_opcode_info(*op).size;
+    for (i = 0; op < &b->byte_code_buf[b->byte_code_len]; i++) {
+        if (*op == OP_debug_info)
+            op += debug_info_size(op);
+        else
+            op += short_opcode_info(*op).size;
+    }
     printf("  opcodes: %d\n", i);
     dump_byte_code(ctx, 3, b->byte_code_buf, b->byte_code_len,
                    b->vardefs, b->arg_count,
@@ -35245,6 +36041,8 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
     for (; pos < bc_len; pos += len) {
         op = bc_buf[pos];
         len = opcode_info[op].size;
+        if (op == OP_debug_info)
+            len = debug_info_size(bc_buf + pos);
         if (op == OP_source_loc) {
             *linep = get_u32(bc_buf + pos + 1);
             *colp = get_u32(bc_buf + pos + 5);
@@ -35686,6 +36484,15 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             dbuf_putc(&bc_out, OP_get_array_el);
             break;
 
+        case OP_debug_info:
+            {
+                /* variable-length instruction: skip based on sub-type */
+                int total_size = debug_info_size(bc_buf + pos);
+                dbuf_put(&bc_out, bc_buf + pos, total_size);
+                pos_next = pos + total_size;
+            }
+            break;
+
         default:
         no_change:
             dbuf_put(&bc_out, bc_buf + pos, len);
@@ -35707,6 +36514,8 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     for (; pos < bc_len; pos = pos_next) {
         op = bc_buf[pos];
         len = opcode_info[op].size;
+        if (op == OP_debug_info)
+            len = debug_info_size(bc_buf + pos);
         pos_next = pos + len;
         dbuf_put(&bc_out, bc_buf + pos, len);
     }
@@ -35974,6 +36783,24 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         s->line_number_last_pc = 0;
     }
 
+    /* emit debug func_enter + arg var_decl + scope_enter at prologue start */
+    if (s->has_debug_info) {
+        int i;
+        dbuf_putc(&bc_out, OP_debug_info);
+        dbuf_putc(&bc_out, JS_DEBUG_INFO_FUNC_ENTER);
+        dbuf_put_u32(&bc_out, JS_DupAtom(s->ctx, s->func_name));
+        dbuf_put_u16(&bc_out, s->arg_count);
+        for (i = 0; i < s->arg_count; i++) {
+            dbuf_putc(&bc_out, OP_debug_info);
+            dbuf_putc(&bc_out, JS_DEBUG_INFO_VAR_DECL);
+            dbuf_put_u32(&bc_out, JS_DupAtom(s->ctx, s->args[i].var_name));
+            dbuf_put_u16(&bc_out, i); /* kind=0 (arg), idx=i */
+        }
+        dbuf_putc(&bc_out, OP_debug_info);
+        dbuf_putc(&bc_out, JS_DEBUG_INFO_SCOPE_ENTER);
+        dbuf_put_u16(&bc_out, 0); /* function body scope level */
+    }
+
     /* initialize the 'home_object' variable if needed */
     if (s->home_object_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
@@ -36050,6 +36877,41 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                performance */
             line_num = get_u32(bc_buf + pos + 1);
             col_num = get_u32(bc_buf + pos + 5);
+            break;
+
+        case OP_debug_info:
+            {
+                /* OP_debug_info has variable-length operands depending on sub-type.
+                   The opcode_info reports size=2 (opcode + u8 sub), but we must
+                   read and copy the full instruction based on sub-type. */
+                uint8_t sub = bc_buf[pos + 1];
+                int total_size = debug_info_size(bc_buf + pos);
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                /* copy the fixed-size portion (opcode + sub) */
+                dbuf_putc(&bc_out, op);
+                dbuf_putc(&bc_out, sub);
+                /* copy sub-type-specific operands, DupAtom for atom operands */
+                switch (sub) {
+                case JS_DEBUG_INFO_SCOPE_ENTER:
+                case JS_DEBUG_INFO_SCOPE_LEAVE:
+                    dbuf_put_u16(&bc_out, get_u16(bc_buf + pos + 2));
+                    break;
+                case JS_DEBUG_INFO_VAR_DECL:
+                case JS_DEBUG_INFO_FUNC_ENTER:
+                    dbuf_put_u32(&bc_out, JS_DupAtom(s->ctx, get_u32(bc_buf + pos + 2)));
+                    dbuf_put_u16(&bc_out, get_u16(bc_buf + pos + 6));
+                    break;
+                case JS_DEBUG_INFO_FUNC_LEAVE:
+                    break; /* no extra operands */
+                default:
+                    /* unknown sub-type: copy remaining bytes as-is */
+                    if (total_size > 2)
+                        dbuf_put(&bc_out, bc_buf + pos + 2, total_size - 2);
+                    break;
+                }
+                /* skip past the full instruction in the input */
+                pos_next = pos + total_size;
+            }
             break;
 
         case OP_debug_sentinel:
@@ -36976,6 +37838,8 @@ static __exception int compute_stack_size(JSContext *ctx,
             printf("%5d: %10s %5d %5d\n", pos, oi->name, stack_len, catch_pos);
 #endif
         pos_next = pos + oi->size;
+        if (op == OP_debug_info)
+            pos_next = pos + debug_info_size(bc_buf + pos);
         if (pos_next > s->bc_len) {
             JS_ThrowInternalError(ctx, "bytecode buffer overflow (op=%d, pc=%d)", op, pos);
             goto fail;
@@ -38464,6 +39328,29 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fun_obj = js_create_function(ctx, fd);
     if (JS_IsException(fun_obj))
         goto fail1;
+    /* NOTE: fd is freed by js_create_function on success, so we must
+       use the bytecode's has_debug_info, not fd->has_debug_info. */
+
+    /* register script for debug enumeration when DEBUG_INFO is set.
+       fun_obj has JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag.
+       For JS_TAG_FUNCTION_BYTECODE, the pointer IS the JSFunctionBytecode.
+       For JS_TAG_MODULE, the module's func_obj holds the bytecode. */
+    {
+        JSFunctionBytecode *fb = NULL;
+        if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_FUNCTION_BYTECODE) {
+            fb = (JSFunctionBytecode *)JS_VALUE_GET_PTR(fun_obj);
+        } else if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_MODULE) {
+            JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(fun_obj);
+            if (!JS_IsUndefined(m->func_obj) && JS_VALUE_GET_TAG(m->func_obj) == JS_TAG_FUNCTION_BYTECODE)
+                fb = (JSFunctionBytecode *)JS_VALUE_GET_PTR(m->func_obj);
+        } else if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_OBJECT) {
+            fb = JS_VALUE_GET_OBJ(fun_obj)->u.func.function_bytecode;
+        }
+        if (fb && fb->has_debug_info && ctx->rt->debug_callback && fb->filename != JS_ATOM_NULL) {
+            dbg_register_script(ctx->rt, fb->filename, fb->line_num, (int)input_len);
+        }
+    }
+
     /* Could add a flag to avoid resolution if necessary */
     if (m) {
         m->func_obj = fun_obj;
@@ -38916,6 +39803,18 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
     while (pos < bc_len) {
         op = bc_buf[pos];
         len = short_opcode_info(op).size;
+        if (op == OP_debug_info) {
+            uint8_t sub = bc_buf[pos + 1];
+            len = debug_info_size(bc_buf + pos);
+            if (sub == JS_DEBUG_INFO_VAR_DECL || sub == JS_DEBUG_INFO_FUNC_ENTER) {
+                atom = get_u32(bc_buf + pos + 2);
+                if (bc_atom_to_idx(s, &val, atom))
+                    goto fail;
+                put_u32(bc_buf + pos + 2, val);
+            }
+            pos += len;
+            continue;
+        }
         switch(short_opcode_info(op).fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
@@ -39824,6 +40723,20 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
     while (pos < bc_len) {
         op = bc_buf[pos];
         len = short_opcode_info(op).size;
+        if (op == OP_debug_info) {
+            uint8_t sub = bc_buf[pos + 1];
+            len = debug_info_size(bc_buf + pos);
+            if (sub == JS_DEBUG_INFO_VAR_DECL || sub == JS_DEBUG_INFO_FUNC_ENTER) {
+                idx = get_u32(bc_buf + pos + 2);
+                if (bc_idx_to_atom(s, &atom, idx)) {
+                    b->byte_code_len = pos;
+                    return -1;
+                }
+                put_u32(bc_buf + pos + 2, atom);
+            }
+            pos += len;
+            continue;
+        }
         switch(short_opcode_info(op).fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:

@@ -451,6 +451,18 @@ add_executable(api-test
 target_compile_definitions(api-test PRIVATE ${qjs_defines})
 target_link_libraries(api-test PRIVATE qjs)
 
+add_executable(debug-bytecodes-test
+    test_debug_bytecodes.c
+)
+target_compile_definitions(debug-bytecodes-test PRIVATE ${qjs_defines})
+target_link_libraries(debug-bytecodes-test PRIVATE qjs)
+
+add_executable(debug-minimal-test
+    test_debug_minimal.c
+)
+target_compile_definitions(debug-minimal-test PRIVATE ${qjs_defines} DUMP_DEBUG_INFO_OPCODES)
+target_link_libraries(debug-minimal-test PRIVATE qjs)
+
 add_executable(lre-test
     lre-test.c
     libregexp.c
