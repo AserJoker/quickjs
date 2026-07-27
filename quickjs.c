@@ -8589,6 +8589,7 @@ int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
     JSContext *ctx;
     JSDebugVarInfo *vars;
     int total, i, frame_count;
+    JSObject *p;
 
     /* walk to the requested frame */
     frame_count = 0;
@@ -8616,7 +8617,7 @@ int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
         ctx = list_entry(el, JSContext, link);
     }
 
-    total = b->arg_count + b->var_count;
+    total = b->arg_count + b->var_count + b->closure_var_count;
     if (total == 0) {
         *pvars = NULL;
         return 0;
@@ -8653,6 +8654,29 @@ int JS_DebugGetFrameLocals(JSRuntime *rt, int frame_index,
         vars[idx].is_const = vd->is_const;
         vars[idx].is_lexical = vd->is_lexical;
         vars[idx].is_captured = vd->is_captured;
+    }
+
+    /* closure variables: these are variables from the enclosing scope
+       (e.g. ES module top-level vars captured by nested functions).
+       They are accessed via the function object's var_refs array. */
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    for (i = 0; i < b->closure_var_count; i++) {
+        int idx = b->arg_count + b->var_count + i;
+        JSClosureVar *cv = &b->closure_var[i];
+        const char *name = ctx ? JS_AtomToCString(ctx, cv->var_name) : NULL;
+        vars[idx].name = name ? dbg_strdup_rt(rt, name) : dbg_strdup_rt(rt, "<closure>");
+        if (ctx) JS_FreeCString(ctx, name);
+        vars[idx].is_arg = 0;
+        vars[idx].is_const = cv->is_const;
+        vars[idx].is_lexical = cv->is_lexical;
+        vars[idx].is_captured = 1;
+        /* Read the value from the var_ref */
+        if (p->u.func.var_refs && p->u.func.var_refs[i]) {
+            JSVarRef *vr = p->u.func.var_refs[i];
+            vars[idx].value = JS_DupValueRT(rt, *vr->pvalue);
+        } else {
+            vars[idx].value = JS_UNDEFINED;
+        }
     }
 
     *pvars = vars;
@@ -8814,8 +8838,37 @@ JSValue JS_DebugEvaluateOnFrameScoped(JSRuntime *rt, int frame_index,
     ctx = b->realm;
     global_obj = JS_GetGlobalObject(ctx);
 
-    /* Get frame locals and inject them as temporary properties on the global object */
-    var_count = JS_DebugGetFrameLocals(rt, frame_index, &vars);
+    /* Get frame locals and inject them as temporary properties on the global object.
+       We also include locals from ALL enclosing frames so that closure variables
+       (e.g. variables from the outer function) are visible during evaluation.
+       Inner frame variables take precedence over outer ones. */
+    {
+        int f;
+        int total_vars = 0;
+        JSDebugVarInfo *all_vars = NULL;
+
+        /* Collect vars from outermost frame to the target frame.
+           Later (inner) frame vars will override earlier (outer) ones. */
+        for (f = frame_count - 1; f >= frame_index; f--) {
+            JSDebugVarInfo *fvars = NULL;
+            int fvar_count = JS_DebugGetFrameLocals(rt, f, &fvars);
+            if (fvar_count > 0 && fvars) {
+                int new_total = total_vars + fvar_count;
+                JSDebugVarInfo *new_arr = js_realloc_rt(rt, all_vars,
+                    new_total * sizeof(JSDebugVarInfo));
+                if (new_arr) {
+                    all_vars = new_arr;
+                    memcpy(all_vars + total_vars, fvars,
+                           fvar_count * sizeof(JSDebugVarInfo));
+                    total_vars = new_total;
+                }
+                /* Free the fvars array but NOT the names/values since we copied them */
+                js_free_rt(rt, fvars);
+            }
+        }
+        vars = all_vars;
+        var_count = total_vars;
+    }
     if (var_count > 0) {
         saved_vals = (JSValue *)js_malloc_rt(rt, var_count * sizeof(JSValue));
         saved_names = (JSAtom *)js_malloc_rt(rt, var_count * sizeof(JSAtom));
@@ -8868,8 +8921,17 @@ JSValue JS_DebugEvaluateOnFrameScoped(JSRuntime *rt, int frame_index,
     js_free_rt(rt, saved_vals);
     js_free_rt(rt, saved_names);
 
-    if (vars)
-        JS_DebugFreeVarInfo(ctx, vars, var_count);
+    if (vars) {
+        /* Free the combined var array. We must free each entry's name and
+           value exactly once. Since we merged multiple frame locals via
+           memcpy, we need to free each entry individually. */
+        for (i = 0; i < var_count; i++) {
+            if (vars[i].name)
+                js_free_rt(rt, vars[i].name);
+            JS_FreeValueRT(rt, vars[i].value);
+        }
+        js_free_rt(rt, vars);
+    }
     JS_FreeValue(ctx, global_obj);
 
     return result;
@@ -8917,6 +8979,7 @@ int JS_DebugGetFrameScopes(JSRuntime *rt, int frame_index,
     JSStackFrame *sf;
     int i, frame_count, scope_count;
     int scope_start, scope_end;
+    int call_idx;
     JSDebugScopeInfo *scopes;
     JSDebugVarInfo *vars = NULL;
     int var_count;
@@ -8931,23 +8994,22 @@ int JS_DebugGetFrameScopes(JSRuntime *rt, int frame_index,
         return -1;
     }
 
-    /* determine scope range for this frame using debug_call_stack */
-    /* frame 0 (topmost) = last entry in debug_call_stack */
+    /* determine scope range for this frame using debug_call_stack.
+       Include ALL active scopes from scope 0 so that closure variables
+       from enclosing functions are visible in the debugger. */
     {
-        int call_idx = rt->debug_call_stack_count - 1 - frame_index;
-        int next_call_depth;
+        call_idx = rt->debug_call_stack_count - 1 - frame_index;
 
         if (call_idx < 0) {
             *pscopes = NULL;
             return 0;
         }
 
-        scope_start = rt->debug_call_stack[call_idx].scope_depth;
-        if (call_idx + 1 < rt->debug_call_stack_count)
-            next_call_depth = rt->debug_call_stack[call_idx + 1].scope_depth;
-        else
-            next_call_depth = rt->debug_scope_count;
-        scope_end = next_call_depth;
+        /* Start from scope 0 to include enclosing (closure) scopes.
+           The frame's own scopes start at debug_call_stack[call_idx].scope_depth,
+           but closure variables live in earlier scopes. */
+        scope_start = 0;
+        scope_end = rt->debug_scope_count;
         scope_count = scope_end - scope_start;
     }
 
@@ -8993,17 +9055,46 @@ int JS_DebugGetFrameScopes(JSRuntime *rt, int frame_index,
                 }
             }
 
-            scopes[i].name = dbg_strdup_rt(rt, "Block");
             scopes[i].scope_level = ds->scope_level;
             scopes[i].var_start = var_idx;
             scopes[i].var_count = scope_var_count > 0 ? scope_var_count : ds->var_count;
             var_idx += scopes[i].var_count;
+
+            /* Name the scope based on its position relative to the current
+               frame's scope depth. Scopes at or deeper than the frame's own
+               scope_depth are "Local"; shallower scopes are "Closure". */
+            {
+                int frame_scope_depth = rt->debug_call_stack[call_idx].scope_depth;
+                int abs_idx = scope_start + i;
+                if (abs_idx >= frame_scope_depth) {
+                    scopes[i].name = dbg_strdup_rt(rt, "Local");
+                } else {
+                    scopes[i].name = dbg_strdup_rt(rt, "Closure");
+                }
+            }
         }
     }
 
     if (vars)
         JS_DebugFreeVarInfo(list_entry(rt->context_list.next, JSContext, link),
                             vars, var_count);
+
+    /* Append a Global scope so the debugger can show global variables.
+       The global scope has var_count=0 here; the DAP bridge will enumerate
+       global properties on demand when the variables request comes in. */
+    {
+        JSDebugScopeInfo *new_scopes = js_realloc_rt(rt, scopes,
+            (scope_count + 1) * sizeof(JSDebugScopeInfo));
+        if (new_scopes) {
+            scopes = new_scopes;
+            memset(&scopes[scope_count], 0, sizeof(JSDebugScopeInfo));
+            scopes[scope_count].name = dbg_strdup_rt(rt, "Global");
+            scopes[scope_count].scope_level = -1; /* sentinel for global */
+            scopes[scope_count].var_start = 0;
+            scopes[scope_count].var_count = 0;
+            scope_count++;
+        }
+    }
 
     *pscopes = scopes;
     return scope_count;
@@ -21920,6 +22011,46 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeCString(ctx, filename);
             }
             BREAK;
+        CASE(OP_debugger_stmt):
+            {
+                if (rt->debug_suppress)
+                    BREAK;
+
+                /* Update cur_pc so JS_DebugCaptureStack reports correct position */
+                sf->cur_pc = pc;
+
+                const char *filename = NULL;
+                int line_num = 0, col_num = 0;
+                {
+                    uint32_t offset = (uint32_t)(pc - 1 - b->byte_code_buf);
+                    line_num = find_line_num(ctx, b, offset, &col_num);
+                    if (b->filename != JS_ATOM_NULL) {
+                        filename = JS_AtomToCString(ctx, b->filename);
+                    }
+                }
+
+                rt->debug_state = JS_DEBUG_PAUSED;
+
+                /* notify the debug callback — this is a debugger; statement */
+                {
+                    JSDebugCallback *cb = (JSDebugCallback *)rt->debug_callback;
+                    if (cb) {
+                        cb(rt, JS_DEBUG_EVENT_DEBUGGER_STMT,
+                           filename ? filename : "<unknown>",
+                           line_num, col_num, 0, rt->debug_opaque);
+                    }
+                }
+
+                /* paused loop: wait for continue/step, drain queue */
+                while (rt->debug_state == JS_DEBUG_PAUSED) {
+                    if (rt->debug_drain_queue)
+                        rt->debug_drain_queue(rt->debug_opaque);
+                }
+
+                if (filename)
+                    JS_FreeCString(ctx, filename);
+            }
+            BREAK;
         CASE(OP_is_undefined_or_null):
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
                 JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
@@ -30425,6 +30556,12 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     close_scopes(s, s->cur_func->scope_level, block_scope_level);
 
     emit_label(s, label_cont);
+    /* Emit debug sentinel at each iteration so breakpoints on the
+       for-in/for-of header fire on each iteration. */
+    if (s->cur_func->has_debug_info) {
+        emit_source_loc_at(s, source_line_num, source_col_num);
+        emit_op(s, OP_debug_sentinel);
+    }
     if (is_for_of) {
         if (is_async) {
             /* call the next method */
@@ -30655,6 +30792,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         {
             int label_cont, label_break;
             BlockEnv break_entry;
+            int source_line_num, source_col_num;
+
+            source_line_num = s->token.line_num;
+            source_col_num = s->token.col_num;
 
             label_cont = new_label(s);
             label_break = new_label(s);
@@ -30668,6 +30809,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             set_eval_ret_undefined(s);
 
             emit_label(s, label_cont);
+            /* Emit debug sentinel at condition check so breakpoints on the
+               while-loop header fire on each iteration. */
+            if (s->cur_func->has_debug_info) {
+                emit_source_loc_at(s, source_line_num, source_col_num);
+                emit_op(s, OP_debug_sentinel);
+            }
             if (js_parse_expr_paren(s))
                 goto fail;
             emit_goto(s, OP_if_false, label_break);
@@ -30685,6 +30832,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         {
             int label_cont, label_break, label1;
             BlockEnv break_entry;
+            int source_line_num, source_col_num;
+
+            source_line_num = s->token.line_num;
+            source_col_num = s->token.col_num;
 
             label_cont = new_label(s);
             label_break = new_label(s);
@@ -30704,6 +30855,13 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
 
             emit_label(s, label_cont);
+            /* Emit debug sentinel at condition check so breakpoints on the
+               do-while header fire on each iteration. Use the 'do' line
+               since that's the loop statement line. */
+            if (s->cur_func->has_debug_info) {
+                emit_source_loc_at(s, source_line_num, source_col_num);
+                emit_op(s, OP_debug_sentinel);
+            }
             if (js_parse_expect(s, TOK_WHILE))
                 goto fail;
             if (js_parse_expr_paren(s))
@@ -30853,6 +31011,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 label_test = label_body;
             } else {
                 emit_label(s, label_test);
+                /* Emit debug sentinel at condition check so breakpoints on the
+                   for-loop header fire on each iteration, not just the first. */
+                if (s->cur_func->has_debug_info) {
+                    emit_source_loc_at(s, source_line_num, source_col_num);
+                    emit_op(s, OP_debug_sentinel);
+                }
                 if (js_parse_expr(s))
                     goto fail;
                 emit_goto(s, OP_if_false, label_break);
@@ -30870,6 +31034,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
 
                 pos_cont = s->cur_func->byte_code.size;
                 emit_label(s, label_cont);
+                /* Emit debug sentinel at update expression so breakpoints on
+                   the for-loop header fire for the i++ part too. */
+                if (s->cur_func->has_debug_info) {
+                    emit_source_loc_at(s, source_line_num, source_col_num);
+                    emit_op(s, OP_debug_sentinel);
+                }
                 if (js_parse_expr(s))
                     goto fail;
                 emit_op(s, OP_drop);
@@ -31357,7 +31527,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             goto fail;
         if (s->cur_func->has_debug_info) {
             emit_source_loc(s);
-            emit_op(s, OP_debug_sentinel);
+            emit_op(s, OP_debugger_stmt);
         }
         if (js_parse_expect_semi(s))
             goto fail;
@@ -36933,6 +37103,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             }
             add_pc2line_info(s, bc_out.size, line_num, col_num);
             dbuf_putc(&bc_out, OP_debug_sentinel);
+            break;
+
+        case OP_debugger_stmt:
+            /* debugger; statement: just emit to output, no bp_site needed */
+            add_pc2line_info(s, bc_out.size, line_num, col_num);
+            dbuf_putc(&bc_out, OP_debugger_stmt);
             break;
 
         case OP_label:

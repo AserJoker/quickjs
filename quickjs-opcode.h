@@ -271,6 +271,7 @@ DEF(  using_dispose_end, 1, 1, 0, none)
 DEF(        using_check, 2, 1, 2, u8)
 DEF(     debug_info, 2, 0, 0, u8)   /* debug: sub-opcode in u8, followed by sub-opcode-specific operands */
 DEF(  debug_sentinel, 1, 0, 0, none) /* breakpoint sentinel: check debug state, no stack effect */
+DEF(  debugger_stmt,  1, 0, 0, none) /* debugger; statement: unconditional pause */
 /* must be the last non short and non temporary opcode */
 DEF(            nop, 1, 0, 0, none)
 
