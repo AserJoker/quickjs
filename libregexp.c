@@ -357,7 +357,7 @@ static int re_string_list_op(REStringList *a, REStringList *b, int op)
         }
         break;
     default:
-        abort();
+        JS_ABORT();
     }
     return 0;
 }
@@ -3327,7 +3327,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
 #ifdef DUMP_EXEC
             printf("unknown opcode pc=%ld\n", pc - 1 - pc_start);
 #endif            
-            abort();
+            JS_ABORT();
         }
     }
 }

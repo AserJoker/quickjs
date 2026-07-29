@@ -25,8 +25,16 @@
 #ifndef CUTILS_H
 #define CUTILS_H
 
-#include <assert.h>
+/* Override abort behavior for QuickJS. Default: log and _exit(3) instead of
+   abort() to avoid the Windows crash dialog and allow graceful teardown
+   when QuickJS encounters an invariant violation during shutdown. */
+#ifndef JS_ABORT
 #include <stdio.h>
+#include <stdlib.h>
+#define JS_ABORT() do { fprintf(stderr, "QuickJS: abort() at %s:%d\n", __FILE__, __LINE__); _exit(3); } while(0)
+#endif
+
+#include <assert.h>
 #include <stdarg.h>
 #include <time.h>
 #if !defined(_MSC_VER)
@@ -1567,11 +1575,11 @@ static inline uint64_t js__hrtime_ns(void) {
     double result;
 
     if (!QueryPerformanceFrequency(&frequency))
-        abort();
+        JS_ABORT();
     assert(frequency.QuadPart != 0);
 
     if (!QueryPerformanceCounter(&counter))
-        abort();
+        JS_ABORT();
     assert(counter.QuadPart != 0);
 
   /* Because we have no guarantee about the order of magnitude of the
@@ -1587,13 +1595,13 @@ static inline uint64_t js__hrtime_ns(void) {
 #ifdef __DJGPP
   struct timeval tv;
   if (gettimeofday(&tv, NULL))
-    abort();
+    JS_ABORT();
   return tv.tv_sec * NANOSEC + tv.tv_usec * 1000;
 #else
   struct timespec t;
 
   if (clock_gettime(CLOCK_MONOTONIC, &t))
-    abort();
+    JS_ABORT();
 
   return t.tv_sec * NANOSEC + t.tv_nsec;
 #endif
@@ -1771,14 +1779,14 @@ static inline void js_cond_broadcast(js_cond_t *cond) {
 
 static inline void js_cond_wait(js_cond_t *cond, js_mutex_t *mutex) {
     if (!SleepConditionVariableCS(cond, mutex, INFINITE))
-        abort();
+        JS_ABORT();
 }
 
 static inline int js_cond_timedwait(js_cond_t *cond, js_mutex_t *mutex, uint64_t timeout) {
     if (SleepConditionVariableCS(cond, mutex, (DWORD)(timeout / 1e6)))
         return 0;
     if (GetLastError() != ERROR_TIMEOUT)
-        abort();
+        JS_ABORT();
     return -1;
 }
 
@@ -1817,47 +1825,47 @@ static inline int js_thread_join(js_thread_t thrd)
 
 static inline void js_once(js_once_t *guard, void (*callback)(void)) {
     if (pthread_once(guard, callback))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_mutex_init(js_mutex_t *mutex) {
     if (pthread_mutex_init(mutex, NULL))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_mutex_destroy(js_mutex_t *mutex) {
     if (pthread_mutex_destroy(mutex))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_mutex_lock(js_mutex_t *mutex) {
     if (pthread_mutex_lock(mutex))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_mutex_unlock(js_mutex_t *mutex) {
     if (pthread_mutex_unlock(mutex))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_cond_init(js_cond_t *cond) {
 #if defined(__APPLE__) && defined(__MACH__)
     if (pthread_cond_init(cond, NULL))
-        abort();
+        JS_ABORT();
 #else
     pthread_condattr_t attr;
 
     if (pthread_condattr_init(&attr))
-        abort();
+        JS_ABORT();
 
     if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC))
-        abort();
+        JS_ABORT();
 
     if (pthread_cond_init(cond, &attr))
-        abort();
+        JS_ABORT();
 
     if (pthread_condattr_destroy(&attr))
-        abort();
+        JS_ABORT();
 #endif
 }
 
@@ -1872,37 +1880,37 @@ static inline void js_cond_destroy(js_cond_t *cond) {
     int err;
 
     if (pthread_mutex_init(&mutex, NULL))
-        abort();
+        JS_ABORT();
 
     if (pthread_mutex_lock(&mutex))
-        abort();
+        JS_ABORT();
 
     ts.tv_sec = 0;
     ts.tv_nsec = 1;
 
     err = pthread_cond_timedwait_relative_np(cond, &mutex, &ts);
     if (err != 0 && err != ETIMEDOUT)
-        abort();
+        JS_ABORT();
 
     if (pthread_mutex_unlock(&mutex))
-        abort();
+        JS_ABORT();
 
     if (pthread_mutex_destroy(&mutex))
-        abort();
+        JS_ABORT();
 #endif /* defined(__APPLE__) && defined(__MACH__) */
 
     if (pthread_cond_destroy(cond))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_cond_signal(js_cond_t *cond) {
     if (pthread_cond_signal(cond))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_cond_broadcast(js_cond_t *cond) {
     if (pthread_cond_broadcast(cond))
-        abort();
+        JS_ABORT();
 }
 
 static inline void js_cond_wait(js_cond_t *cond, js_mutex_t *mutex) {
@@ -1918,10 +1926,10 @@ static inline void js_cond_wait(js_cond_t *cond, js_mutex_t *mutex) {
     if (r == EINVAL && errno == EBUSY)
         return;
     if (r)
-        abort();
+        JS_ABORT();
 #else
     if (pthread_cond_wait(cond, mutex))
-        abort();
+        JS_ABORT();
 #endif
 }
 
@@ -1947,7 +1955,7 @@ static inline int js_cond_timedwait(js_cond_t *cond, js_mutex_t *mutex, uint64_t
     if (r == ETIMEDOUT)
         return -1;
 
-    abort();
+    JS_ABORT();
 
     /* Pacify some compilers. */
     return -1;

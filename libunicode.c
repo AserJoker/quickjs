@@ -496,7 +496,7 @@ int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
             is_in = (a_idx & 1) & ((b_idx & 1) ^ 1);
             break;
         default:
-            abort();
+            JS_ABORT();
         }
         if (is_in != (cr->len & 1)) {
             if (cr_add_point(cr, v))
@@ -1651,7 +1651,7 @@ static int unicode_prop_ops(CharRange *cr, ...)
         case POP_END:
             goto done;
         default:
-            abort();
+            JS_ABORT();
         }
     }
  done:

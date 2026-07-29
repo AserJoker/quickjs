@@ -39,6 +39,10 @@ extern "C" {
 
 #define QUICKJS_NG 1
 
+/* JS_ABORT is defined in cutils.h (included before quickjs.h).
+   It overrides QuickJS's default abort() behavior to log + _exit()
+   instead of abort(), avoiding crash dialogs on Windows. */
+
 /* Helpers. */
 #if defined(_WIN32) || defined(__CYGWIN__)
 # define QUICKJS_NG_PLAT_WIN32 1
